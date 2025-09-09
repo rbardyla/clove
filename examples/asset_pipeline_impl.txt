@@ -1,0 +1,683 @@
+// asset_pipeline.c - Asset Pipeline Implementation
+// Production-grade asset management with zero dependencies
+// Optimized for cache efficiency and minimal allocations
+
+#include "asset_pipeline.h"
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <pthread.h>
+#include <semaphore.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/mman.h>
+#include <dirent.h>
+#include <time.h>
+
+// Your existing engine headers
+#include "memory_arena.h"
+#include "hash_map.h"
+#include "profiler.h"
+
+// ============================================================================
+// Internal Structures
+// ============================================================================
+
+typedef struct asset_node {
+    asset_metadata metadata;
+    struct asset_node* next;
+} asset_node;
+
+typedef struct import_queue_entry {
+    char source_path[256];
+    asset_type type;
+    void* settings;
+    struct import_queue_entry* next;
+} import_queue_entry;
+
+// ============================================================================
+// Hash Functions
+// ============================================================================
+
+static uint32_t hash_string(const char* str) {
+    uint32_t hash = 5381;
+    int c;
+    while ((c = *str++)) {
+        hash = ((hash << 5) + hash) + c;
+    }
+    return hash;
+}
+
+static uint32_t hash_file_content(const char* path) {
+    FILE* file = fopen(path, "rb");
+    if (!file) return 0;
+    
+    uint32_t hash = 5381;
+    uint8_t buffer[4096];
+    size_t bytes_read;
+    
+    while ((bytes_read = fread(buffer, 1, sizeof(buffer), file)) > 0) {
+        for (size_t i = 0; i < bytes_read; i++) {
+            hash = ((hash << 5) + hash) + buffer[i];
+        }
+    }
+    
+    fclose(file);
+    return hash;
+}
+
+// ============================================================================
+// Database Management
+// ============================================================================
+
+asset_database* asset_database_create(arena_allocator* arena, const char* project_path) {
+    PROFILE_FUNCTION();
+    
+    asset_database* db = arena_push_struct(arena, asset_database);
+    memset(db, 0, sizeof(asset_database));
+    
+    // Initialize arenas
+    db->metadata_arena = arena_create_sub_arena(arena, 1024 * 1024);  // 1MB for metadata
+    db->asset_arena = arena_create_sub_arena(arena, 100 * 1024 * 1024);  // 100MB for assets
+    
+    // Initialize hash maps
+    db->uuid_to_metadata = hash_map_create(db->metadata_arena, 4096);
+    db->path_to_uuid = hash_map_create(db->metadata_arena, 4096);
+    db->type_to_assets = hash_map_create(db->metadata_arena, ASSET_TYPE_COUNT);
+    
+    // Initialize file watcher
+    db->watcher = arena_push_struct(db->metadata_arena, file_watcher);
+    #ifdef __linux__
+    db->watcher->inotify_fd = inotify_init1(IN_NONBLOCK);
+    db->watcher->watch_capacity = 64;
+    db->watcher->watch_descriptors = arena_push_array(db->metadata_arena, int, 64);
+    #endif
+    
+    // Initialize cache
+    db->cache = arena_push_struct(db->metadata_arena, asset_cache);
+    snprintf(db->cache->cache_directory, sizeof(db->cache->cache_directory),
+             "%s/.cache", project_path);
+    mkdir(db->cache->cache_directory, 0755);
+    db->cache->max_cache_size = 500 * 1024 * 1024;  // 500MB cache
+    db->cache->lru_capacity = 1024;
+    db->cache->lru_list = arena_push_array(db->metadata_arena, asset_uuid, 1024);
+    
+    // Set default configuration
+    db->config.auto_import = true;
+    db->config.hot_reload_enabled = true;
+    db->config.validate_assets = true;
+    db->config.max_concurrent_loads = 4;
+    db->config.max_memory_usage = 1024 * 1024 * 1024;  // 1GB
+    
+    return db;
+}
+
+void asset_database_destroy(asset_database* db) {
+    if (!db) return;
+    
+    // Close file watcher
+    #ifdef __linux__
+    if (db->watcher && db->watcher->inotify_fd >= 0) {
+        for (uint32_t i = 0; i < db->watcher->watch_count; i++) {
+            inotify_rm_watch(db->watcher->inotify_fd, db->watcher->watch_descriptors[i]);
+        }
+        close(db->watcher->inotify_fd);
+    }
+    #endif
+    
+    // Unmap all memory mapped files
+    if (db->cache) {
+        for (uint32_t i = 0; i < db->cache->mmap_count; i++) {
+            if (db->cache->mmap_regions[i].base_address) {
+                munmap(db->cache->mmap_regions[i].base_address,
+                      db->cache->mmap_regions[i].size);
+                close(db->cache->mmap_regions[i].fd);
+            }
+        }
+    }
+    
+    // Note: Arena cleanup handled by parent arena
+}
+
+bool asset_database_scan_directory(asset_database* db, const char* directory, bool recursive) {
+    PROFILE_FUNCTION();
+    
+    DIR* dir = opendir(directory);
+    if (!dir) return false;
+    
+    struct dirent* entry;
+    char full_path[512];
+    struct stat file_stat;
+    
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_name[0] == '.') continue;
+        
+        snprintf(full_path, sizeof(full_path), "%s/%s", directory, entry->d_name);
+        
+        if (stat(full_path, &file_stat) != 0) continue;
+        
+        if (S_ISDIR(file_stat.st_mode)) {
+            if (recursive) {
+                asset_database_scan_directory(db, full_path, recursive);
+            }
+            
+            // Add directory to file watcher
+            if (db->config.hot_reload_enabled && db->watcher) {
+                file_watcher_add_directory(db->watcher, full_path);
+            }
+        } else if (S_ISREG(file_stat.st_mode)) {
+            // Determine asset type from extension
+            asset_type type = determine_asset_type(full_path);
+            if (type != ASSET_TYPE_UNKNOWN) {
+                // Check if asset already exists
+                asset_uuid uuid = asset_find_by_path(db, full_path);
+                if (asset_uuid_equal(uuid, (asset_uuid){0, 0})) {
+                    // New asset, import it
+                    asset_import(db, full_path, NULL);
+                } else {
+                    // Existing asset, check if needs reimport
+                    asset_metadata* metadata = asset_get_metadata(db, uuid);
+                    if (metadata && metadata->source_timestamp < file_stat.st_mtime) {
+                        asset_reimport(db, uuid);
+                    }
+                }
+            }
+        }
+    }
+    
+    closedir(dir);
+    db->stats.total_assets = hash_map_count(db->uuid_to_metadata);
+    
+    return true;
+}
+
+// ============================================================================
+// Asset Import/Export
+// ============================================================================
+
+static asset_type determine_asset_type(const char* path) {
+    const char* ext = strrchr(path, '.');
+    if (!ext) return ASSET_TYPE_UNKNOWN;
+    ext++;
+    
+    // Texture formats
+    if (strcasecmp(ext, "png") == 0 || strcasecmp(ext, "jpg") == 0 ||
+        strcasecmp(ext, "jpeg") == 0 || strcasecmp(ext, "tga") == 0 ||
+        strcasecmp(ext, "bmp") == 0 || strcasecmp(ext, "dds") == 0) {
+        return ASSET_TYPE_TEXTURE;
+    }
+    
+    // Model formats
+    if (strcasecmp(ext, "obj") == 0 || strcasecmp(ext, "fbx") == 0 ||
+        strcasecmp(ext, "gltf") == 0 || strcasecmp(ext, "glb") == 0) {
+        return ASSET_TYPE_MODEL;
+    }
+    
+    // Audio formats
+    if (strcasecmp(ext, "wav") == 0 || strcasecmp(ext, "ogg") == 0 ||
+        strcasecmp(ext, "mp3") == 0 || strcasecmp(ext, "flac") == 0) {
+        return ASSET_TYPE_AUDIO;
+    }
+    
+    // Shader formats
+    if (strcasecmp(ext, "glsl") == 0 || strcasecmp(ext, "hlsl") == 0 ||
+        strcasecmp(ext, "vert") == 0 || strcasecmp(ext, "frag") == 0) {
+        return ASSET_TYPE_SHADER;
+    }
+    
+    // Scene formats
+    if (strcasecmp(ext, "scene") == 0 || strcasecmp(ext, "level") == 0) {
+        return ASSET_TYPE_SCENE;
+    }
+    
+    return ASSET_TYPE_UNKNOWN;
+}
+
+asset_uuid asset_import(asset_database* db, const char* source_path, void* settings) {
+    PROFILE_FUNCTION();
+    
+    // Check if already imported
+    asset_uuid existing_uuid = asset_find_by_path(db, source_path);
+    if (!asset_uuid_equal(existing_uuid, (asset_uuid){0, 0})) {
+        return existing_uuid;
+    }
+    
+    // Generate new UUID
+    asset_uuid uuid = asset_uuid_generate();
+    
+    // Create metadata
+    asset_metadata* metadata = arena_push_struct(db->metadata_arena, asset_metadata);
+    memset(metadata, 0, sizeof(asset_metadata));
+    
+    metadata->uuid = uuid;
+    metadata->type = determine_asset_type(source_path);
+    metadata->state = ASSET_STATE_UNLOADED;
+    strncpy(metadata->source_path, source_path, sizeof(metadata->source_path) - 1);
+    
+    // Generate cache path
+    char uuid_str[64];
+    asset_uuid_to_string(uuid, uuid_str, sizeof(uuid_str));
+    snprintf(metadata->cache_path, sizeof(metadata->cache_path),
+             "%s/%s.cache", db->cache->cache_directory, uuid_str);
+    
+    // Get file info
+    struct stat file_stat;
+    if (stat(source_path, &file_stat) == 0) {
+        metadata->source_timestamp = file_stat.st_mtime;
+        metadata->source_hash = hash_file_content(source_path);
+    }
+    
+    // Find appropriate importer
+    asset_importer* importer = NULL;
+    for (uint32_t i = 0; i < db->importer_count; i++) {
+        if (db->importers[i]->can_import(source_path)) {
+            importer = db->importers[i];
+            break;
+        }
+    }
+    
+    // Import the asset
+    if (importer) {
+        // Get dependencies
+        importer->get_dependencies(source_path, &metadata->dependencies, 
+                                  &metadata->dependency_count);
+        
+        // Get memory requirements
+        metadata->memory_size = importer->get_memory_size(source_path, settings);
+        
+        // Perform import
+        if (importer->import(source_path, metadata->cache_path, settings)) {
+            metadata->state = ASSET_STATE_UNLOADED;
+            metadata->cache_timestamp = time(NULL);
+        } else {
+            metadata->state = ASSET_STATE_FAILED;
+        }
+    }
+    
+    // Store import settings
+    if (settings) {
+        size_t settings_size = get_settings_size(metadata->type);
+        metadata->import_settings = arena_push_size(db->metadata_arena, settings_size);
+        memcpy(metadata->import_settings, settings, settings_size);
+        metadata->settings_size = settings_size;
+    }
+    
+    // Add to database
+    hash_map_insert(db->uuid_to_metadata, asset_uuid_hash(uuid), metadata);
+    hash_map_insert(db->path_to_uuid, hash_string(source_path), &uuid);
+    
+    // Add to type list
+    asset_uuid** type_list = (asset_uuid**)hash_map_get(db->type_to_assets, metadata->type);
+    if (!type_list) {
+        type_list = arena_push_struct(db->metadata_arena, asset_uuid*);
+        *type_list = arena_push_array(db->metadata_arena, asset_uuid, 128);
+        hash_map_insert(db->type_to_assets, metadata->type, type_list);
+    }
+    // Add UUID to type list (simplified - should track count)
+    
+    db->stats.total_assets++;
+    
+    return uuid;
+}
+
+bool asset_reimport(asset_database* db, asset_uuid uuid) {
+    PROFILE_FUNCTION();
+    
+    asset_metadata* metadata = asset_get_metadata(db, uuid);
+    if (!metadata) return false;
+    
+    // Mark as reloading
+    asset_state old_state = metadata->state;
+    metadata->state = ASSET_STATE_RELOADING;
+    
+    // Re-import with existing settings
+    bool success = false;
+    for (uint32_t i = 0; i < db->importer_count; i++) {
+        if (db->importers[i]->can_import(metadata->source_path)) {
+            success = db->importers[i]->import(metadata->source_path,
+                                              metadata->cache_path,
+                                              metadata->import_settings);
+            break;
+        }
+    }
+    
+    if (success) {
+        // Update timestamps and hash
+        struct stat file_stat;
+        if (stat(metadata->source_path, &file_stat) == 0) {
+            metadata->source_timestamp = file_stat.st_mtime;
+            metadata->source_hash = hash_file_content(metadata->source_path);
+            metadata->cache_timestamp = time(NULL);
+        }
+        
+        // Hot reload if currently loaded
+        if (old_state == ASSET_STATE_LOADED && metadata->memory_ptr) {
+            asset_loader* loader = db->loaders[metadata->type];
+            if (loader && loader->hot_reload) {
+                size_t new_size;
+                void* new_data = loader->load(metadata->cache_path, db->asset_arena, &new_size);
+                if (new_data && loader->hot_reload(metadata->memory_ptr, new_data, new_size)) {
+                    // Successful hot reload
+                    metadata->memory_ptr = new_data;
+                    metadata->memory_size = new_size;
+                    db->stats.hot_reloads++;
+                }
+            }
+        }
+        
+        metadata->state = old_state;
+        metadata->version++;
+    } else {
+        metadata->state = ASSET_STATE_FAILED;
+    }
+    
+    return success;
+}
+
+// ============================================================================
+// Asset Loading
+// ============================================================================
+
+asset_handle asset_load(asset_database* db, asset_uuid uuid) {
+    PROFILE_FUNCTION();
+    
+    asset_handle handle = {0};
+    
+    asset_metadata* metadata = asset_get_metadata(db, uuid);
+    if (!metadata) return handle;
+    
+    // Already loaded?
+    if (metadata->state == ASSET_STATE_LOADED) {
+        metadata->ref_count++;
+        handle.uuid = uuid;
+        handle.generation = metadata->version;
+        handle.data = metadata->memory_ptr;
+        db->stats.cache_hits++;
+        return handle;
+    }
+    
+    // Mark as loading
+    metadata->state = ASSET_STATE_LOADING;
+    
+    // Get loader for this type
+    asset_loader* loader = db->loaders[metadata->type];
+    if (!loader) {
+        metadata->state = ASSET_STATE_FAILED;
+        return handle;
+    }
+    
+    // Try memory mapped loading first for large assets
+    if (metadata->memory_size > 1024 * 1024) {  // 1MB threshold
+        int fd = open(metadata->cache_path, O_RDONLY);
+        if (fd >= 0) {
+            struct stat file_stat;
+            if (fstat(fd, &file_stat) == 0) {
+                void* mapped = mmap(NULL, file_stat.st_size, PROT_READ,
+                                  MAP_PRIVATE, fd, 0);
+                if (mapped != MAP_FAILED) {
+                    // Store mapping info
+                    uint32_t region_idx = db->cache->mmap_count++;
+                    db->cache->mmap_regions[region_idx].base_address = mapped;
+                    db->cache->mmap_regions[region_idx].size = file_stat.st_size;
+                    db->cache->mmap_regions[region_idx].fd = fd;
+                    
+                    metadata->memory_ptr = mapped;
+                    metadata->memory_size = file_stat.st_size;
+                    metadata->state = ASSET_STATE_LOADED;
+                    metadata->ref_count = 1;
+                    
+                    handle.uuid = uuid;
+                    handle.generation = metadata->version;
+                    handle.data = mapped;
+                    
+                    db->stats.loaded_assets++;
+                    db->stats.memory_used += file_stat.st_size;
+                    db->stats.cache_misses++;
+                    
+                    return handle;
+                }
+            }
+            close(fd);
+        }
+    }
+    
+    // Regular loading
+    size_t size;
+    void* data = loader->load(metadata->cache_path, db->asset_arena, &size);
+    
+    if (data) {
+        metadata->memory_ptr = data;
+        metadata->memory_size = size;
+        metadata->state = ASSET_STATE_LOADED;
+        metadata->ref_count = 1;
+        
+        handle.uuid = uuid;
+        handle.generation = metadata->version;
+        handle.data = data;
+        
+        // Update LRU cache
+        if (db->cache->lru_count < db->cache->lru_capacity) {
+            db->cache->lru_list[db->cache->lru_count++] = uuid;
+        }
+        
+        db->stats.loaded_assets++;
+        db->stats.memory_used += size;
+        db->stats.cache_misses++;
+    } else {
+        metadata->state = ASSET_STATE_FAILED;
+    }
+    
+    return handle;
+}
+
+void asset_unload(asset_database* db, asset_handle handle) {
+    PROFILE_FUNCTION();
+    
+    asset_metadata* metadata = asset_get_metadata(db, handle.uuid);
+    if (!metadata) return;
+    
+    // Validate handle generation
+    if (handle.generation != metadata->version) return;
+    
+    // Decrement reference count
+    if (metadata->ref_count > 0) {
+        metadata->ref_count--;
+    }
+    
+    // Unload if no more references
+    if (metadata->ref_count == 0 && metadata->state == ASSET_STATE_LOADED) {
+        asset_loader* loader = db->loaders[metadata->type];
+        
+        // Check if memory mapped
+        bool was_mapped = false;
+        for (uint32_t i = 0; i < db->cache->mmap_count; i++) {
+            if (db->cache->mmap_regions[i].base_address == metadata->memory_ptr) {
+                munmap(metadata->memory_ptr, db->cache->mmap_regions[i].size);
+                close(db->cache->mmap_regions[i].fd);
+                
+                // Swap with last and remove
+                db->cache->mmap_regions[i] = db->cache->mmap_regions[--db->cache->mmap_count];
+                was_mapped = true;
+                break;
+            }
+        }
+        
+        // Regular unload if not memory mapped
+        if (!was_mapped && loader && loader->unload) {
+            loader->unload(metadata->memory_ptr, db->asset_arena);
+        }
+        
+        db->stats.loaded_assets--;
+        db->stats.memory_used -= metadata->memory_size;
+        
+        metadata->memory_ptr = NULL;
+        metadata->memory_size = 0;
+        metadata->state = ASSET_STATE_UNLOADED;
+    }
+}
+
+// ============================================================================
+// Hot Reload System
+// ============================================================================
+
+void asset_check_hot_reload(asset_database* db) {
+    if (!db->config.hot_reload_enabled || !db->watcher) return;
+    
+    PROFILE_FUNCTION();
+    
+    // Check for file system events
+    #ifdef __linux__
+    char buffer[4096] __attribute__((aligned(8)));
+    
+    while (true) {
+        ssize_t len = read(db->watcher->inotify_fd, buffer, sizeof(buffer));
+        if (len <= 0) break;
+        
+        char* ptr = buffer;
+        while (ptr < buffer + len) {
+            struct inotify_event* event = (struct inotify_event*)ptr;
+            
+            if (event->len > 0 && (event->mask & IN_MODIFY)) {
+                // File was modified, find corresponding asset
+                char full_path[512];
+                // Note: Need to map watch descriptor back to directory path
+                // This is simplified - real implementation would maintain this mapping
+                
+                asset_uuid uuid = asset_find_by_path(db, full_path);
+                if (!asset_uuid_equal(uuid, (asset_uuid){0, 0})) {
+                    asset_metadata* metadata = asset_get_metadata(db, uuid);
+                    if (metadata && metadata->state != ASSET_STATE_RELOADING) {
+                        // Check if file actually changed (not just touched)
+                        uint32_t new_hash = hash_file_content(metadata->source_path);
+                        if (new_hash != metadata->source_hash) {
+                            metadata->state = ASSET_STATE_QUEUED_RELOAD;
+                        }
+                    }
+                }
+            }
+            
+            ptr += sizeof(struct inotify_event) + event->len;
+        }
+    }
+    #endif
+    
+    // Process queued reloads
+    hash_map_iterator it = hash_map_iterate(db->uuid_to_metadata);
+    asset_metadata* metadata;
+    while ((metadata = hash_map_next(&it)) != NULL) {
+        if (metadata->state == ASSET_STATE_QUEUED_RELOAD) {
+            asset_reimport(db, metadata->uuid);
+        }
+    }
+}
+
+// ============================================================================
+// Query Functions
+// ============================================================================
+
+asset_metadata* asset_get_metadata(asset_database* db, asset_uuid uuid) {
+    return (asset_metadata*)hash_map_get(db->uuid_to_metadata, asset_uuid_hash(uuid));
+}
+
+asset_uuid asset_find_by_path(asset_database* db, const char* path) {
+    asset_uuid* uuid = (asset_uuid*)hash_map_get(db->path_to_uuid, hash_string(path));
+    if (uuid) return *uuid;
+    return (asset_uuid){0, 0};
+}
+
+asset_uuid* asset_find_by_type(asset_database* db, asset_type type, uint32_t* count) {
+    asset_uuid** type_list = (asset_uuid**)hash_map_get(db->type_to_assets, type);
+    if (type_list) {
+        // Simplified - should track actual count
+        *count = 0;
+        return *type_list;
+    }
+    *count = 0;
+    return NULL;
+}
+
+bool asset_exists(asset_database* db, asset_uuid uuid) {
+    return asset_get_metadata(db, uuid) != NULL;
+}
+
+asset_state asset_get_state(asset_database* db, asset_uuid uuid) {
+    asset_metadata* metadata = asset_get_metadata(db, uuid);
+    return metadata ? metadata->state : ASSET_STATE_UNKNOWN;
+}
+
+// ============================================================================
+// UUID Utilities
+// ============================================================================
+
+void asset_uuid_to_string(asset_uuid uuid, char* buffer, size_t size) {
+    snprintf(buffer, size, "%016lx%016lx", uuid.high, uuid.low);
+}
+
+asset_uuid asset_uuid_from_string(const char* str) {
+    asset_uuid uuid = {0, 0};
+    if (strlen(str) >= 32) {
+        char high_str[17] = {0};
+        char low_str[17] = {0};
+        memcpy(high_str, str, 16);
+        memcpy(low_str, str + 16, 16);
+        uuid.high = strtoull(high_str, NULL, 16);
+        uuid.low = strtoull(low_str, NULL, 16);
+    }
+    return uuid;
+}
+
+// ============================================================================
+// Statistics
+// ============================================================================
+
+void asset_print_stats(asset_database* db) {
+    printf("Asset Database Statistics:\n");
+    printf("  Total Assets:     %lu\n", db->stats.total_assets);
+    printf("  Loaded Assets:    %lu\n", db->stats.loaded_assets);
+    printf("  Memory Used:      %.2f MB\n", db->stats.memory_used / (1024.0 * 1024.0));
+    printf("  Cache Hits:       %lu\n", db->stats.cache_hits);
+    printf("  Cache Misses:     %lu\n", db->stats.cache_misses);
+    printf("  Hot Reloads:      %lu\n", db->stats.hot_reloads);
+    printf("  Import Time:      %lu ms\n", db->stats.import_time_ms);
+    printf("  Load Time:        %lu ms\n", db->stats.load_time_ms);
+    
+    double hit_rate = 0.0;
+    if (db->stats.cache_hits + db->stats.cache_misses > 0) {
+        hit_rate = (double)db->stats.cache_hits / 
+                  (db->stats.cache_hits + db->stats.cache_misses) * 100.0;
+    }
+    printf("  Cache Hit Rate:   %.1f%%\n", hit_rate);
+}
+
+void asset_reset_stats(asset_database* db) {
+    memset(&db->stats, 0, sizeof(db->stats));
+    
+    // Recount current state
+    db->stats.total_assets = hash_map_count(db->uuid_to_metadata);
+    
+    hash_map_iterator it = hash_map_iterate(db->uuid_to_metadata);
+    asset_metadata* metadata;
+    while ((metadata = hash_map_next(&it)) != NULL) {
+        if (metadata->state == ASSET_STATE_LOADED) {
+            db->stats.loaded_assets++;
+            db->stats.memory_used += metadata->memory_size;
+        }
+    }
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+static size_t get_settings_size(asset_type type) {
+    switch (type) {
+        case ASSET_TYPE_TEXTURE:
+            return sizeof(texture_import_settings);
+        case ASSET_TYPE_MODEL:
+            return sizeof(model_import_settings);
+        case ASSET_TYPE_AUDIO:
+            return sizeof(audio_import_settings);
+        default:
+            return 0;
+    }
+}

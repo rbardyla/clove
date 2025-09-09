@@ -1,0 +1,529 @@
+// game_example.c - Complete game using the Scene System
+// Shows real-world integration with your handmade engine
+
+#include "scene_system.h"
+#include "asset_pipeline.h"
+#include "handmade_engine.h"
+#include "handmade_renderer.h"
+#include "neural_ai.h"
+#include "physics_engine.h"
+
+// ============================================================================
+// Game-Specific Components
+// ============================================================================
+
+typedef struct player_controller_component {
+    float move_speed;
+    float jump_height;
+    float current_velocity[3];
+    bool is_grounded;
+    uint32_t inventory[32];
+} player_controller_component;
+
+typedef struct enemy_ai_component {
+    neural_network* brain;     // Your neural AI
+    float aggro_radius;
+    float attack_damage;
+    float patrol_points[8][3];
+    uint32_t current_patrol;
+    entity_id target;
+} enemy_ai_component;
+
+typedef struct health_component {
+    float max_health;
+    float current_health;
+    float regen_rate;
+    float last_damage_time;
+} health_component;
+
+// ============================================================================
+// Game State
+// ============================================================================
+
+typedef struct game_state {
+    // Core systems
+    engine_state* engine;
+    scene_manager* scenes;
+    
+    // Current game state
+    scene* current_level;
+    entity_id player_entity;
+    
+    // Game data
+    float game_time;
+    uint32_t score;
+    uint32_t current_level_index;
+    
+    // Performance monitoring
+    float frame_times[60];
+    uint32_t frame_index;
+} game_state;
+
+// ============================================================================
+// Scene Creation Example
+// ============================================================================
+
+scene* create_gameplay_level(game_state* game, const char* level_name) {
+    PROFILE_FUNCTION();
+    
+    scene* level = scene_create(game->scenes, level_name);
+    
+    // Create environment
+    entity_id ground = scene_create_entity(level, "Ground");
+    {
+        transform_component* transform = scene_add_component(level, ground, COMPONENT_TRANSFORM);
+        transform->position[1] = -1.0f;
+        transform->scale[0] = 100.0f;
+        transform->scale[1] = 1.0f;
+        transform->scale[2] = 100.0f;
+        
+        mesh_renderer_component* renderer = scene_add_component(level, ground, COMPONENT_MESH_RENDERER);
+        renderer->mesh_asset = asset_find_by_path(game->engine->assets, "assets/models/ground.obj");
+        renderer->material_asset = asset_find_by_path(game->engine->assets, "assets/materials/grass.mat");
+        
+        rigidbody_component* physics = scene_add_component(level, ground, COMPONENT_RIGIDBODY);
+        physics->mass = 0;  // Static
+        physics->is_kinematic = true;
+    }
+    
+    // Create player
+    entity_id player = scene_create_entity(level, "Player");
+    game->player_entity = player;
+    {
+        transform_component* transform = scene_add_component(level, player, COMPONENT_TRANSFORM);
+        transform->position[1] = 5.0f;
+        
+        mesh_renderer_component* renderer = scene_add_component(level, player, COMPONENT_MESH_RENDERER);
+        renderer->mesh_asset = asset_find_by_path(game->engine->assets, "assets/models/player.obj");
+        
+        rigidbody_component* physics = scene_add_component(level, player, COMPONENT_RIGIDBODY);
+        physics->mass = 80.0f;
+        physics->use_gravity = true;
+        
+        player_controller_component* controller = scene_add_component(level, player, COMPONENT_PLAYER_CONTROLLER);
+        controller->move_speed = 10.0f;
+        controller->jump_height = 5.0f;
+        
+        health_component* health = scene_add_component(level, player, COMPONENT_HEALTH);
+        health->max_health = 100.0f;
+        health->current_health = 100.0f;
+        health->regen_rate = 1.0f;
+        
+        camera_component* camera = scene_add_component(level, player, COMPONENT_CAMERA);
+        camera->fov = 60.0f;
+        camera->near_plane = 0.1f;
+        camera->far_plane = 1000.0f;
+    }
+    
+    // Spawn enemies using prefabs
+    asset_uuid enemy_prefab = asset_find_by_path(game->engine->assets, "assets/prefabs/enemy.prefab");
+    
+    for (int i = 0; i < 10; i++) {
+        transform_component spawn_transform = {0};
+        spawn_transform.position[0] = (float)(rand() % 100 - 50);
+        spawn_transform.position[1] = 2.0f;
+        spawn_transform.position[2] = (float)(rand() % 100 - 50);
+        
+        entity_id enemy = scene_instantiate_prefab(level, enemy_prefab, &spawn_transform);
+        
+        // Add AI component
+        enemy_ai_component* ai = scene_add_component(level, enemy, COMPONENT_ENEMY_AI);
+        ai->brain = neural_network_create(game->engine->main_arena);
+        ai->aggro_radius = 15.0f;
+        ai->attack_damage = 10.0f;
+        
+        // Set patrol points
+        for (int p = 0; p < 4; p++) {
+            ai->patrol_points[p][0] = spawn_transform.position[0] + (rand() % 20 - 10);
+            ai->patrol_points[p][1] = spawn_transform.position[1];
+            ai->patrol_points[p][2] = spawn_transform.position[2] + (rand() % 20 - 10);
+        }
+    }
+    
+    // Create lighting
+    entity_id sun = scene_create_entity(level, "Sun");
+    {
+        transform_component* transform = scene_add_component(level, sun, COMPONENT_TRANSFORM);
+        transform->rotation[0] = -0.707f;  // 45 degrees
+        transform->rotation[1] = 0.707f;
+        
+        light_component* light = scene_add_component(level, sun, COMPONENT_LIGHT);
+        light->type = LIGHT_DIRECTIONAL;
+        light->color[0] = 1.0f;
+        light->color[1] = 0.95f;
+        light->color[2] = 0.8f;
+        light->intensity = 1.0f;
+    }
+    
+    return level;
+}
+
+// ============================================================================
+// Prefab Creation
+// ============================================================================
+
+void create_enemy_prefab(game_state* game) {
+    PROFILE_FUNCTION();
+    
+    // Create temporary scene for prefab
+    scene* temp = scene_create(game->scenes, "temp_prefab");
+    
+    // Build enemy hierarchy
+    entity_id root = scene_create_entity(temp, "Enemy");
+    {
+        transform_component* transform = scene_add_component(temp, root, COMPONENT_TRANSFORM);
+        transform->scale[0] = transform->scale[1] = transform->scale[2] = 1.0f;
+        
+        mesh_renderer_component* renderer = scene_add_component(temp, root, COMPONENT_MESH_RENDERER);
+        renderer->mesh_asset = asset_find_by_path(game->engine->assets, "assets/models/enemy.obj");
+        
+        rigidbody_component* physics = scene_add_component(temp, root, COMPONENT_RIGIDBODY);
+        physics->mass = 60.0f;
+        physics->use_gravity = true;
+        
+        health_component* health = scene_add_component(temp, root, COMPONENT_HEALTH);
+        health->max_health = 50.0f;
+        health->current_health = 50.0f;
+    }
+    
+    // Create child for weapon
+    entity_id weapon = scene_create_entity(temp, "Weapon");
+    scene_set_parent(temp, weapon, root);
+    {
+        transform_component* transform = scene_add_component(temp, weapon, COMPONENT_TRANSFORM);
+        transform->position[0] = 0.5f;
+        transform->position[1] = 1.0f;
+        
+        mesh_renderer_component* renderer = scene_add_component(temp, weapon, COMPONENT_MESH_RENDERER);
+        renderer->mesh_asset = asset_find_by_path(game->engine->assets, "assets/models/sword.obj");
+    }
+    
+    // Save as prefab
+    prefab_data* prefab = scene_create_prefab(game->scenes, temp, root, "Enemy");
+    scene_save_prefab(game->scenes, prefab, "assets/prefabs/enemy.prefab");
+    
+    // Clean up temp scene
+    scene_unload(game->scenes, temp);
+}
+
+// ============================================================================
+// Game Systems Update
+// ============================================================================
+
+void update_player_controller(game_state* game, float delta_time) {
+    PROFILE_FUNCTION();
+    
+    scene* level = game->current_level;
+    
+    // Get all entities with player controller
+    uint32_t count;
+    entity_id* players = scene_find_entities_with_component(level, 
+                                                           COMPONENT_PLAYER_CONTROLLER, 
+                                                           &count);
+    
+    for (uint32_t i = 0; i < count; i++) {
+        player_controller_component* controller = 
+            scene_get_component(level, players[i], COMPONENT_PLAYER_CONTROLLER);
+        transform_component* transform = 
+            scene_get_component(level, players[i], COMPONENT_TRANSFORM);
+        rigidbody_component* physics = 
+            scene_get_component(level, players[i], COMPONENT_RIGIDBODY);
+        
+        if (!controller || !transform || !physics) continue;
+        
+        // Handle input
+        float move_x = 0, move_z = 0;
+        if (is_key_pressed(KEY_W)) move_z = 1.0f;
+        if (is_key_pressed(KEY_S)) move_z = -1.0f;
+        if (is_key_pressed(KEY_A)) move_x = -1.0f;
+        if (is_key_pressed(KEY_D)) move_x = 1.0f;
+        
+        // Apply movement
+        controller->current_velocity[0] = move_x * controller->move_speed;
+        controller->current_velocity[2] = move_z * controller->move_speed;
+        
+        // Jump
+        if (is_key_pressed(KEY_SPACE) && controller->is_grounded) {
+            controller->current_velocity[1] = controller->jump_height;
+            controller->is_grounded = false;
+        }
+        
+        // Apply to physics
+        physics_set_velocity(game->engine->physics, players[i], controller->current_velocity);
+    }
+}
+
+void update_enemy_ai(game_state* game, float delta_time) {
+    PROFILE_FUNCTION();
+    
+    scene* level = game->current_level;
+    
+    // Batch process all AI for cache efficiency
+    uint32_t count;
+    entity_id* enemies = scene_find_entities_with_component(level, 
+                                                           COMPONENT_ENEMY_AI, 
+                                                           &count);
+    
+    // Get player position for all AI checks
+    transform_component* player_transform = 
+        scene_get_component(level, game->player_entity, COMPONENT_TRANSFORM);
+    if (!player_transform) return;
+    
+    // Process AI in batches for SIMD
+    for (uint32_t i = 0; i < count; i++) {
+        enemy_ai_component* ai = scene_get_component(level, enemies[i], COMPONENT_ENEMY_AI);
+        transform_component* transform = scene_get_component(level, enemies[i], COMPONENT_TRANSFORM);
+        
+        if (!ai || !transform) continue;
+        
+        // Calculate distance to player
+        float dx = player_transform->position[0] - transform->position[0];
+        float dy = player_transform->position[1] - transform->position[1];
+        float dz = player_transform->position[2] - transform->position[2];
+        float dist_sq = dx*dx + dy*dy + dz*dz;
+        
+        if (dist_sq < ai->aggro_radius * ai->aggro_radius) {
+            // In aggro range - pursue player
+            ai->target = game->player_entity;
+            
+            // Run neural network for behavior
+            float inputs[8] = {
+                dx, dy, dz,  // Direction to player
+                sqrtf(dist_sq),  // Distance
+                transform->position[0], transform->position[1], transform->position[2],  // Position
+                game->game_time  // Time factor
+            };
+            
+            float outputs[4];
+            neural_network_forward(ai->brain, inputs, outputs);
+            
+            // Apply AI decision
+            float move_dir[3] = {
+                outputs[0] * 2.0f - 1.0f,  // X movement (-1 to 1)
+                outputs[1],                 // Jump probability
+                outputs[2] * 2.0f - 1.0f   // Z movement (-1 to 1)
+            };
+            
+            // Move towards target
+            physics_apply_force(game->engine->physics, enemies[i], move_dir);
+            
+            // Attack if close enough
+            if (dist_sq < 4.0f && outputs[3] > 0.5f) {
+                // Deal damage to player
+                health_component* player_health = 
+                    scene_get_component(level, game->player_entity, COMPONENT_HEALTH);
+                if (player_health) {
+                    player_health->current_health -= ai->attack_damage * delta_time;
+                }
+            }
+        } else {
+            // Patrol
+            ai->target = 0;
+            
+            float* patrol_point = ai->patrol_points[ai->current_patrol];
+            float dx = patrol_point[0] - transform->position[0];
+            float dz = patrol_point[2] - transform->position[2];
+            
+            if (dx*dx + dz*dz < 1.0f) {
+                // Reached patrol point, go to next
+                ai->current_patrol = (ai->current_patrol + 1) % 4;
+            }
+            
+            // Move towards patrol point
+            float move_dir[3] = { dx * 0.1f, 0, dz * 0.1f };
+            physics_apply_force(game->engine->physics, enemies[i], move_dir);
+        }
+    }
+}
+
+// ============================================================================
+// Main Game Loop
+// ============================================================================
+
+void game_update(game_state* game, float delta_time) {
+    PROFILE_FUNCTION();
+    
+    game->game_time += delta_time;
+    
+    // Update frame time tracking
+    game->frame_times[game->frame_index] = delta_time * 1000.0f;
+    game->frame_index = (game->frame_index + 1) % 60;
+    
+    // Check for scene hot-reload
+    asset_check_hot_reload(game->engine->assets);
+    
+    // Update game systems
+    update_player_controller(game, delta_time);
+    update_enemy_ai(game, delta_time);
+    
+    // Update physics
+    physics_update(game->engine->physics, delta_time);
+    
+    // Update animations
+    // animation_update(game->engine->animations, delta_time);
+    
+    // Check level transitions
+    if (is_key_pressed(KEY_F1)) {
+        // Quick save
+        scene_save(game->scenes, game->current_level, "saves/quicksave.scene");
+    }
+    
+    if (is_key_pressed(KEY_F2)) {
+        // Quick load
+        scene* loaded = scene_load(game->scenes, "saves/quicksave.scene");
+        if (loaded) {
+            scene_transition(game->scenes, loaded, 0.5f, NULL);
+        }
+    }
+}
+
+void game_render(game_state* game) {
+    PROFILE_FUNCTION();
+    
+    scene* level = game->current_level;
+    if (!level) return;
+    
+    // Get camera
+    uint32_t camera_count;
+    entity_id* cameras = scene_find_entities_with_component(level, 
+                                                           COMPONENT_CAMERA, 
+                                                           &camera_count);
+    
+    if (camera_count > 0) {
+        camera_component* camera = scene_get_component(level, cameras[0], COMPONENT_CAMERA);
+        transform_component* cam_transform = scene_get_component(level, cameras[0], COMPONENT_TRANSFORM);
+        
+        // Set view matrix
+        renderer_set_view_matrix(game->engine->renderer, cam_transform->world_matrix);
+        renderer_set_projection(game->engine->renderer, camera->fov, 
+                               camera->aspect_ratio, camera->near_plane, camera->far_plane);
+    }
+    
+    // Render all mesh renderers
+    uint32_t renderer_count;
+    entity_id* renderers = scene_find_entities_with_component(level, 
+                                                             COMPONENT_MESH_RENDERER, 
+                                                             &renderer_count);
+    
+    // Sort by material for batching
+    // ... sorting code
+    
+    // Submit draw calls
+    for (uint32_t i = 0; i < renderer_count; i++) {
+        mesh_renderer_component* mesh = 
+            scene_get_component(level, renderers[i], COMPONENT_MESH_RENDERER);
+        transform_component* transform = 
+            scene_get_component(level, renderers[i], COMPONENT_TRANSFORM);
+        
+        if (mesh && transform) {
+            // Load assets if needed
+            asset_handle mesh_handle = asset_load(game->engine->assets, mesh->mesh_asset);
+            asset_handle material_handle = asset_load(game->engine->assets, mesh->material_asset);
+            
+            if (mesh_handle.data && material_handle.data) {
+                renderer_draw_mesh(game->engine->renderer, 
+                                 mesh_handle.data, 
+                                 material_handle.data,
+                                 transform->world_matrix);
+            }
+        }
+    }
+    
+    // Render debug info
+    if (is_key_pressed(KEY_F3)) {
+        float avg_frame_time = 0;
+        for (int i = 0; i < 60; i++) {
+            avg_frame_time += game->frame_times[i];
+        }
+        avg_frame_time /= 60.0f;
+        
+        char debug_text[256];
+        snprintf(debug_text, sizeof(debug_text),
+                "FPS: %.1f | Entities: %u | Draw Calls: %u | Memory: %.1f MB",
+                1000.0f / avg_frame_time,
+                level->entity_count,
+                renderer_count,
+                game->engine->main_arena->used / (1024.0f * 1024.0f));
+        
+        renderer_draw_text(game->engine->renderer, debug_text, 10, 10);
+    }
+}
+
+// ============================================================================
+// Entry Point
+// ============================================================================
+
+int main(int argc, char** argv) {
+    // Initialize engine
+    engine_state* engine = engine_initialize();
+    
+    // Create game state
+    game_state* game = calloc(1, sizeof(game_state));
+    game->engine = engine;
+    
+    // Initialize scene system
+    game->scenes = scene_manager_create(engine->main_arena, 
+                                       engine->entities, 
+                                       engine->assets);
+    
+    // Register game-specific components
+    scene_register_component(game->scenes, COMPONENT_PLAYER_CONTROLLER,
+                            sizeof(player_controller_component),
+                            NULL, NULL);  // Add serialization later
+    
+    scene_register_component(game->scenes, COMPONENT_ENEMY_AI,
+                            sizeof(enemy_ai_component),
+                            NULL, NULL);
+    
+    scene_register_component(game->scenes, COMPONENT_HEALTH,
+                            sizeof(health_component),
+                            NULL, NULL);
+    
+    // Create prefabs
+    create_enemy_prefab(game);
+    
+    // Load or create first level
+    scene* first_level = scene_load(game->scenes, "assets/levels/level01.scene");
+    if (!first_level) {
+        first_level = create_gameplay_level(game, "Level 01");
+        scene_save(game->scenes, first_level, "assets/levels/level01.scene");
+    }
+    
+    game->current_level = first_level;
+    scene_set_active(game->scenes, first_level);
+    
+    // Main game loop
+    uint64_t last_time = get_time_ns();
+    
+    while (!should_quit()) {
+        uint64_t current_time = get_time_ns();
+        float delta_time = (current_time - last_time) / 1000000000.0f;
+        last_time = current_time;
+        
+        // Update
+        game_update(game, delta_time);
+        
+        // Render
+        renderer_begin_frame(engine->renderer);
+        game_render(game);
+        gui_render(engine->gui);
+        renderer_end_frame(engine->renderer);
+        
+        // Frame limiter for 60 FPS
+        while (get_time_ns() - last_time < 16666667) {
+            // Busy wait for precise timing
+        }
+    }
+    
+    // Save current level before exit
+    if (game->current_level) {
+        scene_save(game->scenes, game->current_level, "saves/autosave.scene");
+    }
+    
+    // Cleanup
+    scene_manager_destroy(game->scenes);
+    engine_shutdown(engine);
+    free(game);
+    
+    return 0;
+}

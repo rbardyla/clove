@@ -1,0 +1,717 @@
+// scene_system.c - Scene System Implementation
+// Binary serialization with zero allocations, prefab support, fast loading
+
+#include "scene_system.h"
+#include "memory_arena.h"
+#include "entity_system.h"
+#include "asset_pipeline.h"
+#include "profiler.h"
+#include <stdio.h>
+#include <string.h>
+#include <time.h>
+
+// ============================================================================
+// Component Serialization Functions
+// ============================================================================
+
+static void serialize_transform(void* component, uint8_t* buffer, size_t* offset) {
+    transform_component* t = (transform_component*)component;
+    write_vec3(buffer, offset, t->position);
+    write_quat(buffer, offset, t->rotation);
+    write_vec3(buffer, offset, t->scale);
+    // Don't serialize cached matrices - recalculate on load
+}
+
+static void deserialize_transform(void* component, const uint8_t* buffer, size_t* offset) {
+    transform_component* t = (transform_component*)component;
+    read_vec3(buffer, offset, t->position);
+    read_quat(buffer, offset, t->rotation);
+    read_vec3(buffer, offset, t->scale);
+    // Recalculate matrices
+    handmade_calculate_transform_matrix(t);
+}
+
+static void serialize_mesh_renderer(void* component, uint8_t* buffer, size_t* offset) {
+    mesh_renderer_component* r = (mesh_renderer_component*)component;
+    write_u32(buffer, offset, r->mesh_asset.high >> 32);
+    write_u32(buffer, offset, r->mesh_asset.high & 0xFFFFFFFF);
+    write_u32(buffer, offset, r->mesh_asset.low >> 32);
+    write_u32(buffer, offset, r->mesh_asset.low & 0xFFFFFFFF);
+    write_u32(buffer, offset, r->render_flags);
+    write_vec3(buffer, offset, r->bounds_min);
+    write_vec3(buffer, offset, r->bounds_max);
+}
+
+static void deserialize_mesh_renderer(void* component, const uint8_t* buffer, size_t* offset) {
+    mesh_renderer_component* r = (mesh_renderer_component*)component;
+    r->mesh_asset.high = ((uint64_t)read_u32(buffer, offset) << 32) | read_u32(buffer, offset);
+    r->mesh_asset.low = ((uint64_t)read_u32(buffer, offset) << 32) | read_u32(buffer, offset);
+    r->render_flags = read_u32(buffer, offset);
+    read_vec3(buffer, offset, r->bounds_min);
+    read_vec3(buffer, offset, r->bounds_max);
+}
+
+// ============================================================================
+// Scene Manager
+// ============================================================================
+
+scene_manager* scene_manager_create(arena_allocator* arena,
+                                   entity_system* entities,
+                                   asset_database* assets) {
+    PROFILE_FUNCTION();
+    
+    scene_manager* manager = arena_push_struct(arena, scene_manager);
+    memset(manager, 0, sizeof(scene_manager));
+    
+    manager->arena = arena;
+    manager->scene_arena = arena_create_sub_arena(arena, 50 * 1024 * 1024); // 50MB for scenes
+    manager->entity_system = entities;
+    manager->asset_database = assets;
+    
+    // Register standard components
+    scene_register_component(manager, COMPONENT_TRANSFORM, 
+                            sizeof(transform_component),
+                            serialize_transform, deserialize_transform);
+    
+    scene_register_component(manager, COMPONENT_MESH_RENDERER,
+                            sizeof(mesh_renderer_component),
+                            serialize_mesh_renderer, deserialize_mesh_renderer);
+    
+    // Register other components...
+    
+    return manager;
+}
+
+void scene_register_component(scene_manager* manager,
+                             component_type type,
+                             size_t size,
+                             void (*serialize)(void*, uint8_t*, size_t*),
+                             void (*deserialize)(void*, const uint8_t*, size_t*)) {
+    if (type >= COMPONENT_MAX) return;
+    
+    component_info* info = &manager->component_registry[type];
+    info->type = type;
+    info->size = size;
+    info->version = 1;
+    info->serialize = serialize;
+    info->deserialize = deserialize;
+    info->get_size = NULL;  // Use fixed size
+    info->fixup_references = NULL;
+    
+    if (type >= manager->registered_components) {
+        manager->registered_components = type + 1;
+    }
+}
+
+// ============================================================================
+// Scene Creation and Management
+// ============================================================================
+
+scene* scene_create(scene_manager* manager, const char* name) {
+    PROFILE_FUNCTION();
+    
+    scene* s = arena_push_struct(manager->scene_arena, scene);
+    memset(s, 0, sizeof(scene));
+    
+    strncpy(s->name, name, sizeof(s->name) - 1);
+    s->uuid = asset_uuid_generate();
+    
+    // Pre-allocate entity storage
+    s->entity_capacity = 1024;
+    s->entities = arena_push_array(manager->scene_arena, scene_entity, s->entity_capacity);
+    
+    // Pre-allocate component arrays
+    for (uint32_t i = 0; i < manager->registered_components; i++) {
+        if (manager->component_registry[i].size > 0) {
+            s->component_capacities[i] = 256;
+            size_t array_size = manager->component_registry[i].size * s->component_capacities[i];
+            s->component_arrays[i] = arena_push_size(manager->scene_arena, array_size);
+        }
+    }
+    
+    // Pre-allocate asset reference array
+    s->asset_capacity = 256;
+    s->asset_refs = arena_push_array(manager->scene_arena, asset_uuid, s->asset_capacity);
+    
+    s->arena = manager->scene_arena;
+    s->is_loaded = true;
+    
+    // Create root entity
+    s->root_entity = scene_create_entity(s, "Root");
+    
+    return s;
+}
+
+// ============================================================================
+// Scene Serialization (Save)
+// ============================================================================
+
+bool scene_save(scene_manager* manager, scene* scene, const char* path) {
+    PROFILE_FUNCTION();
+    
+    uint64_t start_time = get_time_ms();
+    
+    FILE* file = fopen(path, "wb");
+    if (!file) return false;
+    
+    // Calculate total size needed
+    size_t total_size = sizeof(scene_header);
+    total_size += scene->entity_count * sizeof(scene_entity);
+    
+    for (uint32_t i = 0; i < COMPONENT_MAX; i++) {
+        if (scene->component_counts[i] > 0) {
+            total_size += sizeof(uint32_t) * 2;  // Type and count
+            total_size += manager->component_registry[i].size * scene->component_counts[i];
+        }
+    }
+    
+    total_size += scene->asset_count * sizeof(asset_uuid);
+    
+    // Allocate buffer for entire scene
+    uint8_t* buffer = arena_push_size(manager->arena, total_size);
+    size_t offset = 0;
+    
+    // Write header
+    scene_header header = {0};
+    header.magic = 0x454E4353;  // 'SCNE'
+    header.version = 1;
+    header.flags = 0;
+    header.header_size = sizeof(scene_header);
+    
+    strncpy(header.name, scene->name, sizeof(header.name) - 1);
+    strncpy(header.author, "Handmade Engine", sizeof(header.author) - 1);
+    header.created_time = time(NULL);
+    header.modified_time = header.created_time;
+    
+    header.entity_count = scene->entity_count;
+    header.asset_count = scene->asset_count;
+    
+    // Calculate offsets
+    header.entity_offset = sizeof(scene_header);
+    header.component_offset = header.entity_offset + (scene->entity_count * sizeof(scene_entity));
+    header.asset_offset = header.component_offset;  // Will be updated
+    
+    // Write header placeholder
+    memcpy(buffer + offset, &header, sizeof(scene_header));
+    offset = header.entity_offset;
+    
+    // Write entities
+    for (uint32_t i = 0; i < scene->entity_count; i++) {
+        scene_entity* entity = &scene->entities[i];
+        
+        // Write entity data
+        write_u32(buffer, &offset, entity->id);
+        write_u32(buffer, &offset, entity->parent);
+        memcpy(buffer + offset, entity->name, 64);
+        offset += 64;
+        write_u32(buffer, &offset, entity->flags);
+        write_u32(buffer, &offset, entity->layer);
+        write_u32(buffer, &offset, entity->tag);
+        
+        // Write component mask
+        for (int j = 0; j < COMPONENT_MAX / 64; j++) {
+            write_u32(buffer, &offset, entity->component_mask[j] >> 32);
+            write_u32(buffer, &offset, entity->component_mask[j] & 0xFFFFFFFF);
+        }
+        
+        write_u32(buffer, &offset, entity->child_count);
+        write_u32(buffer, &offset, entity->first_child_index);
+    }
+    
+    // Write components
+    header.component_offset = offset;
+    uint32_t component_count = 0;
+    
+    for (uint32_t type = 0; type < COMPONENT_MAX; type++) {
+        if (scene->component_counts[type] == 0) continue;
+        
+        component_info* info = &manager->component_registry[type];
+        if (!info->serialize) continue;
+        
+        // Write component type header
+        write_u32(buffer, &offset, type);
+        write_u32(buffer, &offset, scene->component_counts[type]);
+        
+        // Serialize each component
+        uint8_t* component_array = (uint8_t*)scene->component_arrays[type];
+        for (uint32_t i = 0; i < scene->component_counts[type]; i++) {
+            void* component = component_array + (i * info->size);
+            info->serialize(component, buffer, &offset);
+        }
+        
+        component_count++;
+    }
+    
+    // Update component count in header
+    header.component_count = component_count;
+    
+    // Write asset references
+    header.asset_offset = offset;
+    for (uint32_t i = 0; i < scene->asset_count; i++) {
+        write_u32(buffer, &offset, scene->asset_refs[i].high >> 32);
+        write_u32(buffer, &offset, scene->asset_refs[i].high & 0xFFFFFFFF);
+        write_u32(buffer, &offset, scene->asset_refs[i].low >> 32);
+        write_u32(buffer, &offset, scene->asset_refs[i].low & 0xFFFFFFFF);
+    }
+    
+    // Calculate checksums
+    header.entity_checksum = calculate_checksum(buffer + header.entity_offset,
+                                               scene->entity_count * sizeof(scene_entity));
+    header.component_checksum = calculate_checksum(buffer + header.component_offset,
+                                                  offset - header.component_offset);
+    header.asset_checksum = calculate_checksum(buffer + header.asset_offset,
+                                              scene->asset_count * sizeof(asset_uuid));
+    
+    // Write final header with correct offsets
+    memcpy(buffer, &header, sizeof(scene_header));
+    
+    // Write entire buffer to file
+    size_t written = fwrite(buffer, 1, offset, file);
+    fclose(file);
+    
+    // Update stats
+    manager->stats.scenes_saved++;
+    manager->stats.serialization_time_ms += get_time_ms() - start_time;
+    
+    // Import as asset
+    if (manager->asset_database) {
+        asset_import(manager->asset_database, path, NULL);
+    }
+    
+    return written == offset;
+}
+
+// ============================================================================
+// Scene Deserialization (Load)
+// ============================================================================
+
+scene* scene_load(scene_manager* manager, const char* path) {
+    PROFILE_FUNCTION();
+    
+    uint64_t start_time = get_time_ms();
+    
+    FILE* file = fopen(path, "rb");
+    if (!file) return NULL;
+    
+    // Get file size
+    fseek(file, 0, SEEK_END);
+    size_t file_size = ftell(file);
+    fseek(file, 0, SEEK_SET);
+    
+    // Memory map for fast loading (zero-copy)
+    int fd = fileno(file);
+    uint8_t* buffer = mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (buffer == MAP_FAILED) {
+        // Fallback to regular read
+        buffer = arena_push_size(manager->arena, file_size);
+        fread(buffer, 1, file_size, file);
+    }
+    fclose(file);
+    
+    size_t offset = 0;
+    
+    // Read and validate header
+    scene_header header;
+    memcpy(&header, buffer, sizeof(scene_header));
+    offset = sizeof(scene_header);
+    
+    if (header.magic != 0x454E4353) {
+        if (buffer != MAP_FAILED) munmap(buffer, file_size);
+        return NULL;
+    }
+    
+    // Create scene
+    scene* s = scene_create(manager, header.name);
+    
+    // Ensure capacity
+    if (header.entity_count > s->entity_capacity) {
+        s->entity_capacity = header.entity_count * 2;
+        s->entities = arena_push_array(s->arena, scene_entity, s->entity_capacity);
+    }
+    
+    // Read entities
+    offset = header.entity_offset;
+    for (uint32_t i = 0; i < header.entity_count; i++) {
+        scene_entity* entity = &s->entities[i];
+        
+        entity->id = read_u32(buffer, &offset);
+        entity->parent = read_u32(buffer, &offset);
+        memcpy(entity->name, buffer + offset, 64);
+        offset += 64;
+        entity->flags = read_u32(buffer, &offset);
+        entity->layer = read_u32(buffer, &offset);
+        entity->tag = read_u32(buffer, &offset);
+        
+        // Read component mask
+        for (int j = 0; j < COMPONENT_MAX / 64; j++) {
+            uint32_t high = read_u32(buffer, &offset);
+            uint32_t low = read_u32(buffer, &offset);
+            entity->component_mask[j] = ((uint64_t)high << 32) | low;
+        }
+        
+        entity->child_count = read_u32(buffer, &offset);
+        entity->first_child_index = read_u32(buffer, &offset);
+    }
+    s->entity_count = header.entity_count;
+    
+    // Read components
+    offset = header.component_offset;
+    for (uint32_t i = 0; i < header.component_count; i++) {
+        uint32_t type = read_u32(buffer, &offset);
+        uint32_t count = read_u32(buffer, &offset);
+        
+        if (type >= COMPONENT_MAX) continue;
+        
+        component_info* info = &manager->component_registry[type];
+        if (!info->deserialize || info->size == 0) continue;
+        
+        // Ensure capacity
+        if (count > s->component_capacities[type]) {
+            s->component_capacities[type] = count * 2;
+            size_t array_size = info->size * s->component_capacities[type];
+            s->component_arrays[type] = arena_push_size(s->arena, array_size);
+        }
+        
+        // Deserialize components
+        uint8_t* component_array = (uint8_t*)s->component_arrays[type];
+        for (uint32_t j = 0; j < count; j++) {
+            void* component = component_array + (j * info->size);
+            info->deserialize(component, buffer, &offset);
+        }
+        
+        s->component_counts[type] = count;
+    }
+    
+    // Read asset references
+    offset = header.asset_offset;
+    if (header.asset_count > s->asset_capacity) {
+        s->asset_capacity = header.asset_count * 2;
+        s->asset_refs = arena_push_array(s->arena, asset_uuid, s->asset_capacity);
+    }
+    
+    for (uint32_t i = 0; i < header.asset_count; i++) {
+        uint32_t high_high = read_u32(buffer, &offset);
+        uint32_t high_low = read_u32(buffer, &offset);
+        uint32_t low_high = read_u32(buffer, &offset);
+        uint32_t low_low = read_u32(buffer, &offset);
+        
+        s->asset_refs[i].high = ((uint64_t)high_high << 32) | high_low;
+        s->asset_refs[i].low = ((uint64_t)low_high << 32) | low_low;
+    }
+    s->asset_count = header.asset_count;
+    
+    // Load all referenced assets
+    if (manager->asset_database) {
+        for (uint32_t i = 0; i < s->asset_count; i++) {
+            asset_load(manager->asset_database, s->asset_refs[i]);
+        }
+    }
+    
+    // Cleanup
+    if (buffer != MAP_FAILED) {
+        munmap(buffer, file_size);
+    }
+    
+    // Update stats
+    manager->stats.scenes_loaded++;
+    manager->stats.total_entities += s->entity_count;
+    manager->stats.deserialization_time_ms += get_time_ms() - start_time;
+    
+    // Add to loaded scenes
+    if (manager->loaded_count < 16) {
+        manager->loaded_scenes[manager->loaded_count++] = s;
+    }
+    
+    s->is_loaded = true;
+    s->is_dirty = false;
+    
+    return s;
+}
+
+// ============================================================================
+// Entity Management
+// ============================================================================
+
+entity_id scene_create_entity(scene* scene, const char* name) {
+    PROFILE_FUNCTION();
+    
+    if (scene->entity_count >= scene->entity_capacity) {
+        // Need to grow - but we're using arena allocation
+        // In production, you'd handle this differently
+        return 0;
+    }
+    
+    uint32_t index = scene->entity_count++;
+    scene_entity* entity = &scene->entities[index];
+    
+    memset(entity, 0, sizeof(scene_entity));
+    entity->id = index + 1;  // Never use 0 as valid ID
+    strncpy(entity->name, name, sizeof(entity->name) - 1);
+    entity->parent = 0;
+    entity->flags = 1;  // Active by default
+    
+    scene->is_dirty = true;
+    
+    return entity->id;
+}
+
+entity_id scene_instantiate_prefab(scene* scene, asset_uuid prefab_uuid,
+                                  transform_component* transform) {
+    PROFILE_FUNCTION();
+    
+    // Find prefab in cache
+    prefab_data* prefab = NULL;
+    for (uint32_t i = 0; i < scene_manager->prefab_count; i++) {
+        if (asset_uuid_equal(scene_manager->prefabs[i]->uuid, prefab_uuid)) {
+            prefab = scene_manager->prefabs[i];
+            break;
+        }
+    }
+    
+    if (!prefab) {
+        // Load prefab if not cached
+        // ... load prefab from asset
+        return 0;
+    }
+    
+    // Create root entity
+    entity_id root = scene_create_entity(scene, prefab->root.name);
+    
+    // Map old IDs to new IDs
+    entity_id* id_map = arena_push_array(scene->arena, entity_id, prefab->entity_count);
+    
+    // Create all entities
+    for (uint32_t i = 0; i < prefab->entity_count; i++) {
+        scene_entity* prefab_entity = &prefab->entities[i];
+        entity_id new_id = scene_create_entity(scene, prefab_entity->name);
+        id_map[i] = new_id;
+        
+        scene_entity* new_entity = scene_get_entity(scene, new_id);
+        new_entity->flags = prefab_entity->flags;
+        new_entity->layer = prefab_entity->layer;
+        new_entity->tag = prefab_entity->tag;
+        
+        // Copy component mask
+        memcpy(new_entity->component_mask, prefab_entity->component_mask,
+               sizeof(new_entity->component_mask));
+    }
+    
+    // Fix up parent references
+    for (uint32_t i = 0; i < prefab->entity_count; i++) {
+        if (prefab->entities[i].parent != 0) {
+            // Find parent in map
+            for (uint32_t j = 0; j < prefab->entity_count; j++) {
+                if (prefab->entities[j].id == prefab->entities[i].parent) {
+                    scene_set_parent(scene, id_map[i], id_map[j]);
+                    break;
+                }
+            }
+        }
+    }
+    
+    // Copy components
+    for (uint32_t type = 0; type < COMPONENT_MAX; type++) {
+        if (prefab->component_counts[type] == 0) continue;
+        
+        // ... copy component data with ID remapping
+    }
+    
+    // Apply provided transform to root
+    if (transform) {
+        transform_component* root_transform = 
+            scene_get_component(scene, root, COMPONENT_TRANSFORM);
+        if (root_transform) {
+            *root_transform = *transform;
+        }
+    }
+    
+    // Create prefab instance tracking
+    if (scene->prefab_count < 256) {
+        prefab_instance* instance = &scene->prefabs[scene->prefab_count++];
+        instance->prefab_uuid = prefab_uuid;
+        instance->root_entity = root;
+        instance->override_count = 0;
+    }
+    
+    return root;
+}
+
+// ============================================================================
+// Component Management
+// ============================================================================
+
+void* scene_add_component(scene* scene, entity_id entity, component_type type) {
+    PROFILE_FUNCTION();
+    
+    scene_entity* ent = scene_get_entity(scene, entity);
+    if (!ent || type >= COMPONENT_MAX) return NULL;
+    
+    // Check if already has component
+    uint32_t mask_index = type / 64;
+    uint64_t mask_bit = 1ULL << (type % 64);
+    
+    if (ent->component_mask[mask_index] & mask_bit) {
+        return scene_get_component(scene, entity, type);
+    }
+    
+    // Add component
+    if (scene->component_counts[type] >= scene->component_capacities[type]) {
+        // Need to grow array
+        return NULL;  // In production, handle reallocation
+    }
+    
+    uint32_t index = scene->component_counts[type]++;
+    component_info* info = &scene_manager->component_registry[type];
+    
+    uint8_t* array = (uint8_t*)scene->component_arrays[type];
+    void* component = array + (index * info->size);
+    
+    // Clear component memory
+    memset(component, 0, info->size);
+    
+    // Set component bit
+    ent->component_mask[mask_index] |= mask_bit;
+    
+    scene->is_dirty = true;
+    
+    return component;
+}
+
+void* scene_get_component(scene* scene, entity_id entity, component_type type) {
+    scene_entity* ent = scene_get_entity(scene, entity);
+    if (!ent || type >= COMPONENT_MAX) return NULL;
+    
+    // Check component mask
+    uint32_t mask_index = type / 64;
+    uint64_t mask_bit = 1ULL << (type % 64);
+    
+    if (!(ent->component_mask[mask_index] & mask_bit)) {
+        return NULL;
+    }
+    
+    // Find component index (simplified - in production use entity-to-component mapping)
+    // This is O(n) but could be O(1) with proper indexing
+    uint32_t component_index = 0;
+    for (uint32_t i = 0; i < scene->entity_count; i++) {
+        if (scene->entities[i].id == entity) break;
+        if (scene->entities[i].component_mask[mask_index] & mask_bit) {
+            component_index++;
+        }
+    }
+    
+    component_info* info = &scene_manager->component_registry[type];
+    uint8_t* array = (uint8_t*)scene->component_arrays[type];
+    return array + (component_index * info->size);
+}
+
+scene_entity* scene_get_entity(scene* scene, entity_id id) {
+    // O(n) lookup - in production use hash map
+    for (uint32_t i = 0; i < scene->entity_count; i++) {
+        if (scene->entities[i].id == id) {
+            return &scene->entities[i];
+        }
+    }
+    return NULL;
+}
+
+// ============================================================================
+// Scene Queries
+// ============================================================================
+
+entity_id* scene_find_entities_with_component(scene* scene, component_type type,
+                                             uint32_t* count) {
+    PROFILE_FUNCTION();
+    
+    if (type >= COMPONENT_MAX) {
+        *count = 0;
+        return NULL;
+    }
+    
+    // Count entities with component
+    uint32_t mask_index = type / 64;
+    uint64_t mask_bit = 1ULL << (type % 64);
+    
+    uint32_t found_count = 0;
+    for (uint32_t i = 0; i < scene->entity_count; i++) {
+        if (scene->entities[i].component_mask[mask_index] & mask_bit) {
+            found_count++;
+        }
+    }
+    
+    if (found_count == 0) {
+        *count = 0;
+        return NULL;
+    }
+    
+    // Allocate result array
+    entity_id* results = arena_push_array(scene->arena, entity_id, found_count);
+    
+    // Fill results
+    uint32_t result_index = 0;
+    for (uint32_t i = 0; i < scene->entity_count; i++) {
+        if (scene->entities[i].component_mask[mask_index] & mask_bit) {
+            results[result_index++] = scene->entities[i].id;
+        }
+    }
+    
+    *count = found_count;
+    return results;
+}
+
+// ============================================================================
+// Scene Transitions
+// ============================================================================
+
+void scene_set_active(scene_manager* manager, scene* scene) {
+    if (manager->active_scene == scene) return;
+    
+    manager->active_scene = scene;
+    
+    if (scene) {
+        scene->is_active = true;
+        
+        // Sync with entity system
+        if (manager->entity_system) {
+            entity_system_clear(manager->entity_system);
+            
+            // Create entities in entity system
+            for (uint32_t i = 0; i < scene->entity_count; i++) {
+                entity_system_create(manager->entity_system);
+                // ... sync components
+            }
+        }
+    }
+}
+
+void scene_transition(scene_manager* manager, scene* to_scene,
+                     float duration,
+                     void (*callback)(scene*, scene*, float)) {
+    manager->transition.in_transition = true;
+    manager->transition.transition_time = 0;
+    manager->transition.transition_duration = duration;
+    manager->transition.transition_callback = callback;
+    manager->next_scene = to_scene;
+    
+    // Start loading next scene async if needed
+    if (to_scene && !to_scene->is_loaded) {
+        // ... async load
+    }
+}
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+static uint32_t calculate_checksum(const uint8_t* data, size_t size) {
+    uint32_t checksum = 0;
+    for (size_t i = 0; i < size; i++) {
+        checksum = ((checksum << 5) + checksum) + data[i];
+    }
+    return checksum;
+}
+
+static uint64_t get_time_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}

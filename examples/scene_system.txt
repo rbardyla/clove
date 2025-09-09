@@ -1,0 +1,473 @@
+// scene_system.h - Complete Scene Management for Handmade Engine
+// Binary serialization, prefabs, scene transitions, zero allocations
+// Integrates with Entity System and Asset Pipeline
+
+#ifndef SCENE_SYSTEM_H
+#define SCENE_SYSTEM_H
+
+#include <stdint.h>
+#include <stdbool.h>
+#include <stddef.h>
+
+// Forward declarations from your systems
+typedef struct arena_allocator arena_allocator;
+typedef struct asset_database asset_database;
+typedef struct entity_system entity_system;
+typedef uint32_t entity_id;
+typedef struct asset_uuid asset_uuid;
+
+// ============================================================================
+// Scene Format Specification
+// ============================================================================
+
+// Scene file header - identifies and versions scene files
+typedef struct scene_header {
+    uint32_t magic;           // 'SCNE' (0x454E4353)
+    uint32_t version;         // Scene format version
+    uint32_t flags;           // Scene flags (compressed, encrypted, etc)
+    uint32_t header_size;     // Size of this header
+    
+    // Scene metadata
+    char name[64];            // Scene name
+    char author[64];          // Creator name
+    uint64_t created_time;    // Creation timestamp
+    uint64_t modified_time;   // Last modification
+    
+    // Data offsets (for fast seeking)
+    uint32_t entity_offset;   // Offset to entity data
+    uint32_t component_offset;// Offset to component data
+    uint32_t asset_offset;    // Offset to asset references
+    uint32_t prefab_offset;   // Offset to prefab data
+    uint32_t metadata_offset; // Offset to custom metadata
+    
+    // Counts
+    uint32_t entity_count;
+    uint32_t component_count;
+    uint32_t asset_count;
+    uint32_t prefab_count;
+    
+    // Checksums for validation
+    uint32_t entity_checksum;
+    uint32_t component_checksum;
+    uint32_t asset_checksum;
+} scene_header;
+
+// Component type registry - extensible
+typedef enum component_type {
+    COMPONENT_NONE = 0,
+    COMPONENT_TRANSFORM,
+    COMPONENT_MESH_RENDERER,
+    COMPONENT_SPRITE_RENDERER,
+    COMPONENT_CAMERA,
+    COMPONENT_LIGHT,
+    COMPONENT_RIGIDBODY,
+    COMPONENT_COLLIDER,
+    COMPONENT_AUDIO_SOURCE,
+    COMPONENT_AUDIO_LISTENER,
+    COMPONENT_SCRIPT,
+    COMPONENT_ANIMATOR,
+    COMPONENT_PARTICLE_SYSTEM,
+    COMPONENT_NEURAL_NPC,
+    COMPONENT_NETWORK_OBJECT,
+    COMPONENT_CUSTOM = 1000,  // User-defined components start here
+    COMPONENT_MAX = 2048
+} component_type;
+
+// Entity data in scene
+typedef struct scene_entity {
+    entity_id id;             // Entity ID (regenerated on load)
+    entity_id parent;         // Parent entity (for hierarchy)
+    char name[64];            // Entity name
+    uint32_t flags;           // Entity flags (active, static, etc)
+    uint32_t layer;           // Rendering/physics layer
+    uint32_t tag;             // Gameplay tag
+    
+    // Component mask (bit per component type)
+    uint64_t component_mask[COMPONENT_MAX / 64];
+    
+    // Children info
+    uint32_t child_count;
+    uint32_t first_child_index;  // Index in entity array
+} scene_entity;
+
+// Transform component - most common
+typedef struct transform_component {
+    float position[3];
+    float rotation[4];        // Quaternion
+    float scale[3];
+    float local_matrix[16];   // Cached local transform
+    float world_matrix[16];   // Cached world transform
+} transform_component;
+
+// Mesh renderer component
+typedef struct mesh_renderer_component {
+    asset_uuid mesh_asset;
+    asset_uuid material_asset;
+    uint32_t render_flags;
+    float bounds_min[3];
+    float bounds_max[3];
+} mesh_renderer_component;
+
+// Camera component
+typedef struct camera_component {
+    float fov;
+    float near_plane;
+    float far_plane;
+    float aspect_ratio;
+    uint32_t render_layers;
+    float viewport[4];        // x, y, width, height
+    float clear_color[4];
+    uint32_t clear_flags;
+} camera_component;
+
+// Physics component
+typedef struct rigidbody_component {
+    float mass;
+    float drag;
+    float angular_drag;
+    float center_of_mass[3];
+    float inertia_tensor[9];
+    uint32_t constraints;     // Freeze position/rotation axes
+    bool use_gravity;
+    bool is_kinematic;
+} rigidbody_component;
+
+// Neural NPC component (your AI system)
+typedef struct neural_npc_component {
+    asset_uuid brain_asset;   // Neural network weights
+    float personality[8];     // Personality vector
+    float memory_capacity;
+    uint32_t behavior_flags;
+    char dialogue_state[32];
+} neural_npc_component;
+
+// Component serialization info
+typedef struct component_info {
+    component_type type;
+    size_t size;
+    uint32_t version;
+    
+    // Function pointers for serialization
+    void (*serialize)(void* component, uint8_t* buffer, size_t* offset);
+    void (*deserialize)(void* component, const uint8_t* buffer, size_t* offset);
+    size_t (*get_size)(void* component);
+    void (*fixup_references)(void* component, entity_id* remap_table);
+} component_info;
+
+// ============================================================================
+// Prefab System
+// ============================================================================
+
+typedef struct prefab_data {
+    asset_uuid uuid;
+    char name[64];
+    
+    // Root entity template
+    scene_entity root;
+    
+    // All entities in prefab
+    scene_entity* entities;
+    uint32_t entity_count;
+    
+    // Component data
+    void** components;        // Array of component arrays
+    uint32_t* component_counts;
+    
+    // Asset references
+    asset_uuid* assets;
+    uint32_t asset_count;
+    
+    // Override info for instances
+    uint32_t override_mask;
+} prefab_data;
+
+typedef struct prefab_instance {
+    asset_uuid prefab_uuid;
+    entity_id root_entity;
+    
+    // Overridden values
+    struct {
+        uint32_t component_type;
+        uint32_t field_offset;
+        uint8_t value[64];    // Max override size
+    } *overrides;
+    uint32_t override_count;
+} prefab_instance;
+
+// ============================================================================
+// Scene Management
+// ============================================================================
+
+typedef struct scene {
+    char name[64];
+    asset_uuid uuid;
+    
+    // Entity storage
+    scene_entity* entities;
+    uint32_t entity_count;
+    uint32_t entity_capacity;
+    
+    // Component storage (SoA for cache efficiency)
+    void* component_arrays[COMPONENT_MAX];
+    uint32_t component_counts[COMPONENT_MAX];
+    uint32_t component_capacities[COMPONENT_MAX];
+    
+    // Asset references
+    asset_uuid* asset_refs;
+    uint32_t asset_count;
+    uint32_t asset_capacity;
+    
+    // Prefab instances
+    prefab_instance* prefabs;
+    uint32_t prefab_count;
+    
+    // Scene hierarchy
+    entity_id root_entity;
+    
+    // Runtime data
+    bool is_loaded;
+    bool is_active;
+    bool is_dirty;
+    
+    // Memory
+    arena_allocator* arena;
+} scene;
+
+typedef struct scene_manager {
+    // Active scenes
+    scene* active_scene;
+    scene* next_scene;        // For transitions
+    
+    // Scene cache
+    scene* loaded_scenes[16];
+    uint32_t loaded_count;
+    
+    // Component registry
+    component_info component_registry[COMPONENT_MAX];
+    uint32_t registered_components;
+    
+    // Prefab cache
+    prefab_data* prefabs[256];
+    uint32_t prefab_count;
+    
+    // Entity system integration
+    entity_system* entity_system;
+    asset_database* asset_database;
+    
+    // Scene transition
+    struct {
+        bool in_transition;
+        float transition_time;
+        float transition_duration;
+        void (*transition_callback)(scene* from, scene* to, float t);
+    } transition;
+    
+    // Memory
+    arena_allocator* arena;
+    arena_allocator* scene_arena;
+    
+    // Statistics
+    struct {
+        uint64_t scenes_loaded;
+        uint64_t scenes_saved;
+        uint64_t total_entities;
+        uint64_t total_components;
+        uint64_t serialization_time_ms;
+        uint64_t deserialization_time_ms;
+    } stats;
+} scene_manager;
+
+// ============================================================================
+// Public API
+// ============================================================================
+
+// Scene Manager
+scene_manager* scene_manager_create(arena_allocator* arena, 
+                                   entity_system* entities,
+                                   asset_database* assets);
+void scene_manager_destroy(scene_manager* manager);
+
+// Component Registration
+void scene_register_component(scene_manager* manager, 
+                             component_type type,
+                             size_t size,
+                             void (*serialize)(void*, uint8_t*, size_t*),
+                             void (*deserialize)(void*, const uint8_t*, size_t*));
+
+// Scene Operations
+scene* scene_create(scene_manager* manager, const char* name);
+scene* scene_load(scene_manager* manager, const char* path);
+scene* scene_load_async(scene_manager* manager, const char* path, 
+                        void (*callback)(scene*, void*), void* user_data);
+bool scene_save(scene_manager* manager, scene* scene, const char* path);
+void scene_unload(scene_manager* manager, scene* scene);
+void scene_clear(scene* scene);
+
+// Scene Activation
+void scene_set_active(scene_manager* manager, scene* scene);
+scene* scene_get_active(scene_manager* manager);
+void scene_transition(scene_manager* manager, scene* to_scene, 
+                     float duration, 
+                     void (*callback)(scene*, scene*, float));
+
+// Entity Management
+entity_id scene_create_entity(scene* scene, const char* name);
+entity_id scene_instantiate_prefab(scene* scene, asset_uuid prefab_uuid, 
+                                  transform_component* transform);
+void scene_destroy_entity(scene* scene, entity_id id);
+scene_entity* scene_get_entity(scene* scene, entity_id id);
+entity_id scene_find_entity(scene* scene, const char* name);
+
+// Component Management
+void* scene_add_component(scene* scene, entity_id entity, component_type type);
+void* scene_get_component(scene* scene, entity_id entity, component_type type);
+void scene_remove_component(scene* scene, entity_id entity, component_type type);
+bool scene_has_component(scene* scene, entity_id entity, component_type type);
+
+// Hierarchy
+void scene_set_parent(scene* scene, entity_id child, entity_id parent);
+entity_id scene_get_parent(scene* scene, entity_id entity);
+entity_id* scene_get_children(scene* scene, entity_id parent, uint32_t* count);
+void scene_get_hierarchy(scene* scene, entity_id root, 
+                        void (*callback)(entity_id, uint32_t depth, void*), 
+                        void* user_data);
+
+// Prefabs
+prefab_data* scene_create_prefab(scene_manager* manager, scene* scene, 
+                                entity_id root, const char* name);
+bool scene_save_prefab(scene_manager* manager, prefab_data* prefab, 
+                      const char* path);
+prefab_data* scene_load_prefab(scene_manager* manager, const char* path);
+void scene_apply_prefab_overrides(scene* scene, entity_id instance_root);
+void scene_revert_prefab_overrides(scene* scene, entity_id instance_root);
+
+// Queries
+entity_id* scene_find_entities_with_component(scene* scene, component_type type, 
+                                             uint32_t* count);
+entity_id* scene_find_entities_in_radius(scene* scene, float position[3], 
+                                        float radius, uint32_t* count);
+entity_id* scene_find_entities_with_tag(scene* scene, uint32_t tag, 
+                                       uint32_t* count);
+
+// Serialization Helpers
+size_t scene_calculate_size(scene* scene);
+bool scene_validate(scene* scene);
+void scene_optimize(scene* scene);  // Defragment and sort for cache
+
+// ============================================================================
+// Fast Binary Serialization
+// ============================================================================
+
+// Write primitives with endianness handling
+static inline void write_u8(uint8_t* buffer, size_t* offset, uint8_t value) {
+    buffer[(*offset)++] = value;
+}
+
+static inline void write_u32(uint8_t* buffer, size_t* offset, uint32_t value) {
+    // Little endian
+    buffer[(*offset)++] = value & 0xFF;
+    buffer[(*offset)++] = (value >> 8) & 0xFF;
+    buffer[(*offset)++] = (value >> 16) & 0xFF;
+    buffer[(*offset)++] = (value >> 24) & 0xFF;
+}
+
+static inline void write_f32(uint8_t* buffer, size_t* offset, float value) {
+    union { float f; uint32_t u; } convert = { .f = value };
+    write_u32(buffer, offset, convert.u);
+}
+
+static inline void write_vec3(uint8_t* buffer, size_t* offset, float v[3]) {
+    write_f32(buffer, offset, v[0]);
+    write_f32(buffer, offset, v[1]);
+    write_f32(buffer, offset, v[2]);
+}
+
+static inline void write_quat(uint8_t* buffer, size_t* offset, float q[4]) {
+    write_f32(buffer, offset, q[0]);
+    write_f32(buffer, offset, q[1]);
+    write_f32(buffer, offset, q[2]);
+    write_f32(buffer, offset, q[3]);
+}
+
+static inline void write_mat4(uint8_t* buffer, size_t* offset, float m[16]) {
+    for (int i = 0; i < 16; i++) {
+        write_f32(buffer, offset, m[i]);
+    }
+}
+
+// Read primitives
+static inline uint8_t read_u8(const uint8_t* buffer, size_t* offset) {
+    return buffer[(*offset)++];
+}
+
+static inline uint32_t read_u32(const uint8_t* buffer, size_t* offset) {
+    uint32_t value = buffer[(*offset)++];
+    value |= (uint32_t)buffer[(*offset)++] << 8;
+    value |= (uint32_t)buffer[(*offset)++] << 16;
+    value |= (uint32_t)buffer[(*offset)++] << 24;
+    return value;
+}
+
+static inline float read_f32(const uint8_t* buffer, size_t* offset) {
+    union { float f; uint32_t u; } convert;
+    convert.u = read_u32(buffer, offset);
+    return convert.f;
+}
+
+static inline void read_vec3(const uint8_t* buffer, size_t* offset, float v[3]) {
+    v[0] = read_f32(buffer, offset);
+    v[1] = read_f32(buffer, offset);
+    v[2] = read_f32(buffer, offset);
+}
+
+static inline void read_quat(const uint8_t* buffer, size_t* offset, float q[4]) {
+    q[0] = read_f32(buffer, offset);
+    q[1] = read_f32(buffer, offset);
+    q[2] = read_f32(buffer, offset);
+    q[3] = read_f32(buffer, offset);
+}
+
+// ============================================================================
+// Performance Optimizations
+// ============================================================================
+
+// Cache-friendly iteration
+#define SCENE_ITERATE_COMPONENTS(scene, type, var) \
+    for (uint32_t _i = 0; _i < (scene)->component_counts[type]; _i++) { \
+        void* var = ((uint8_t*)(scene)->component_arrays[type]) + \
+                   (_i * scene_manager->component_registry[type].size);
+
+#define SCENE_ITERATE_END }
+
+// SIMD-friendly component layout
+typedef struct simd_transform_batch {
+    float* positions_x;
+    float* positions_y;
+    float* positions_z;
+    float* rotations_x;
+    float* rotations_y;
+    float* rotations_z;
+    float* rotations_w;
+    float* scales_x;
+    float* scales_y;
+    float* scales_z;
+    uint32_t count;
+} simd_transform_batch;
+
+// Convert AoS to SoA for SIMD processing
+static inline void scene_get_transform_batch(scene* scene, 
+                                            simd_transform_batch* batch) {
+    transform_component* transforms = 
+        (transform_component*)scene->component_arrays[COMPONENT_TRANSFORM];
+    uint32_t count = scene->component_counts[COMPONENT_TRANSFORM];
+    
+    for (uint32_t i = 0; i < count; i++) {
+        batch->positions_x[i] = transforms[i].position[0];
+        batch->positions_y[i] = transforms[i].position[1];
+        batch->positions_z[i] = transforms[i].position[2];
+        // ... etc
+    }
+    batch->count = count;
+}
+
+#endif // SCENE_SYSTEM_H
