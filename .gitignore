@@ -1,0 +1,56 @@
+# Build outputs
+build/
+*.o
+*.a
+*.so
+*.dll
+*.exe
+*.out
+*.app
+
+# Debug files
+*.dSYM/
+*.pdb
+*.ilk
+*.map
+*.exp
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Temporary files
+*.tmp
+*.temp
+*.log
+*.bak
+
+# Core dumps
+core
+core.*
+vgcore.*
+
+# Profiling
+*.prof
+*.gcov
+*.gcda
+*.gcno
+gmon.out
+
+# Test outputs
+test_results/
+coverage/
+
+# Binary demos
+*_demo
+*_test
+perf_test
+particle_demo
+
+# Platform specific
+Thumbs.db
+desktop.ini

@@ -1,0 +1,36 @@
+[package]
+name = "handmade-engine"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Window creation and event handling (cross-platform, but we're on Linux!)
+winit = "0.28"
+
+# Software renderer - we'll draw pixels directly to a buffer
+pixels = "0.12"
+
+# Math library for vectors, matrices etc
+glam = "0.25"
+
+# Image loading for textures
+image = "0.24"
+
+# Serialization for save games
+serde = { version = "1.0", features = ["derive"] }
+bincode = "1.3"
+
+# Time utilities for audit reports
+chrono = "0.4"
+
+# JIT compilation (optional but powerful)
+# Note: LLVM integration would require llvm-sys crate in production
+# For now, we'll use our custom JIT interface
+
+[profile.dev]
+opt-level = 1  # Some optimization even in debug for better performance
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3

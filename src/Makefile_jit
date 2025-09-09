@@ -1,0 +1,73 @@
+# Makefile for Neural JIT Integration Demo
+# =========================================
+# Handmade Neural Engine with Profile-Guided JIT Compilation
+
+CC = gcc
+CFLAGS = -O3 -march=native -mavx2 -mfma -Wall -Wextra
+CFLAGS += -fno-omit-frame-pointer  # For profiling
+CFLAGS += -DNEURAL_USE_AVX2=1 -DHANDMADE_DEBUG=0
+LDFLAGS = -lm -lpthread
+
+# Source files
+PROFILER_SRC = neural_profiler.c
+JIT_SRC = neural_jit.c
+INTEGRATION_SRC = neural_jit_integration.c
+DEMO_SRC = neural_jit_demo_integrated.c
+
+# Object files
+OBJS = neural_profiler.o neural_jit.o neural_jit_integration.o neural_stubs.o
+
+# Target executable
+TARGET = neural_jit_demo_integrated
+
+# Default target
+all: $(TARGET)
+
+# Build the demo
+$(TARGET): $(OBJS) $(DEMO_SRC)
+	$(CC) $(CFLAGS) -o $@ $(DEMO_SRC) $(OBJS) $(LDFLAGS)
+	@echo "═══════════════════════════════════════════════════════════"
+	@echo "BUILD COMPLETE: $(TARGET)"
+	@echo "═══════════════════════════════════════════════════════════"
+	@echo "Run with: ./$(TARGET)"
+	@echo ""
+
+# Build profiler
+neural_profiler.o: neural_profiler.c neural_profiler.h
+	$(CC) $(CFLAGS) -c neural_profiler.c -o $@
+
+# Build JIT compiler
+neural_jit.o: neural_jit.c neural_jit.h
+	$(CC) $(CFLAGS) -c neural_jit.c -o $@
+
+# Build integration layer
+neural_jit_integration.o: neural_jit_integration.c neural_jit.h neural_profiler.h
+	$(CC) $(CFLAGS) -c neural_jit_integration.c -o $@
+
+# Build stub implementations
+neural_stubs.o: neural_stubs.c
+	$(CC) $(CFLAGS) -c neural_stubs.c -o $@
+
+# Clean build artifacts
+clean:
+	rm -f $(OBJS) $(TARGET) stubs_for_demo.c
+	@echo "Cleaned build artifacts"
+
+# Run the demo
+run: $(TARGET)
+	@echo "═══════════════════════════════════════════════════════════"
+	@echo "RUNNING NEURAL JIT DEMO"
+	@echo "═══════════════════════════════════════════════════════════"
+	./$(TARGET)
+
+# Profile with perf (Linux)
+profile: $(TARGET)
+	perf record -g ./$(TARGET)
+	perf report
+
+# Check assembly output
+asm: $(INTEGRATION_SRC)
+	$(CC) $(CFLAGS) -S -masm=intel neural_jit_integration.c -o neural_jit_integration.s
+	@echo "Generated assembly in neural_jit_integration.s"
+
+.PHONY: all clean run profile asm
