@@ -1,9 +1,13 @@
 // handmade_gui.c - Production-ready immediate mode GUI implementation
 // PERFORMANCE: All widgets render in single pass, no allocations, 60fps target
 
+#include <stdint.h>
+#define _POSIX_C_SOURCE 199309L
+#include <time.h>
+typedef uint64_t u64;
+
 // Simple CPU timer for GUI logging (if not provided by platform)
 #ifndef ReadCPUTimer
-#include <time.h>
 static inline u64 ReadCPUTimer(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);

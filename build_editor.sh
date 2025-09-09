@@ -18,8 +18,6 @@ mkdir -p build
 echo "Compiling editor demo..."
 $CC $CFLAGS $INCLUDES -o build/editor_demo \
     editor_game_demo.c \
-    game/crystal_dungeons.c \
-    game/sprite_assets.c \
     game/neural_enemies.c \
     game/game_audio.c \
     systems/ai/handmade_neural.c \
