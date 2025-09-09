@@ -1,0 +1,1086 @@
+#define _GNU_SOURCE
+#include "handmade_platform.h"
+
+#include <X11/Xlib.h>
+#include <X11/Xutil.h>
+#include <X11/Xatom.h>
+#include <X11/XKBlib.h>
+#include <GL/gl.h>
+#include <GL/glx.h>
+
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/time.h>
+#include <sys/inotify.h>
+#include <pthread.h>
+#include <dlfcn.h>
+#include <dirent.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdarg.h>
+#include <time.h>
+
+// Linux platform specific data
+typedef struct {
+    Display* display;
+    Window window;
+    GLXContext gl_context;
+    Atom wm_delete_window;
+    Atom clipboard;
+    Atom targets;
+    Atom utf8_string;
+    XIM input_method;
+    XIC input_context;
+    Cursor hidden_cursor;
+    
+    int inotify_fd;
+    int watch_fd;
+    
+    bool running;
+    bool cursor_visible;
+    bool fullscreen;
+    
+    struct timespec start_time;
+} LinuxPlatformData;
+
+// Work queue implementation
+typedef struct {
+    PlatformWork* entries;
+    volatile u32 read_index;
+    volatile u32 write_index;
+    volatile u32 completion_count;
+    volatile u32 completion_goal;
+    pthread_t* threads;
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+    u32 thread_count;
+    bool running;
+} LinuxWorkQueue;
+
+// Global state
+static PlatformState g_platform = {0};
+static PlatformAPI g_platform_api = {0};
+static LinuxPlatformData g_linux_data = {0};
+
+PlatformAPI* Platform = &g_platform_api;
+PlatformState* GlobalPlatform = &g_platform;
+
+// Forward declarations
+static void InitializePlatformAPI(void);
+static bool InitializeWindow(u32 width, u32 height, const char* title);
+static bool InitializeOpenGL(void);
+static void ProcessEvents(void);
+static KeyCode TranslateKeycode(KeySym keysym);
+static void UpdateInput(void);
+static void* WorkerThreadProc(void* param);
+
+// Memory functions
+static void* LinuxAllocateMemory(usize size) {
+    void* result = mmap(0, size, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    return (result == MAP_FAILED) ? NULL : result;
+}
+
+static void LinuxFreeMemory(void* memory) {
+    if (memory) {
+        // Need to know the size for munmap, should track this
+        // For now, we'll use the arena system primarily
+    }
+}
+
+static void LinuxCopyMemory(void* dest, const void* src, usize size) {
+    memcpy(dest, src, size);
+}
+
+static void LinuxZeroMemory(void* memory, usize size) {
+    memset(memory, 0, size);
+}
+
+// File I/O functions
+static PlatformFile LinuxReadFile(const char* path, MemoryArena* arena) {
+    PlatformFile result = {0};
+    
+    int fd = open(path, O_RDONLY);
+    if (fd >= 0) {
+        struct stat file_stat;
+        if (fstat(fd, &file_stat) == 0) {
+            result.size = file_stat.st_size;
+            result.data = PushSize(arena, result.size + 1);
+            
+            if (result.data) {
+                ssize_t bytes_read = read(fd, result.data, result.size);
+                if (bytes_read == result.size) {
+                    ((char*)result.data)[result.size] = 0;
+                } else {
+                    result.data = NULL;
+                    result.size = 0;
+                }
+            }
+        }
+        close(fd);
+    }
+    
+    return result;
+}
+
+static bool LinuxWriteFile(const char* path, void* data, usize size) {
+    bool result = false;
+    
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd >= 0) {
+        ssize_t bytes_written = write(fd, data, size);
+        result = (bytes_written == size);
+        close(fd);
+    }
+    
+    return result;
+}
+
+static bool LinuxFileExists(const char* path) {
+    struct stat file_stat;
+    return (stat(path, &file_stat) == 0);
+}
+
+static u64 LinuxGetFileTime(const char* path) {
+    struct stat file_stat;
+    if (stat(path, &file_stat) == 0) {
+        return file_stat.st_mtime;
+    }
+    return 0;
+}
+
+static bool LinuxDeleteFile(const char* path) {
+    return (unlink(path) == 0);
+}
+
+static bool LinuxCreateDirectory(const char* path) {
+    return (mkdir(path, 0755) == 0);
+}
+
+static char** LinuxListDirectory(const char* path, u32* count, MemoryArena* arena) {
+    char** result = NULL;
+    *count = 0;
+    
+    DIR* dir = opendir(path);
+    if (dir) {
+        // Count entries first
+        struct dirent* entry;
+        u32 entry_count = 0;
+        while ((entry = readdir(dir)) != NULL) {
+            if (strcmp(entry->d_name, ".") != 0 && 
+                strcmp(entry->d_name, "..") != 0) {
+                entry_count++;
+            }
+        }
+        
+        if (entry_count > 0) {
+            result = PushArray(arena, char*, entry_count);
+            rewinddir(dir);
+            
+            u32 index = 0;
+            while ((entry = readdir(dir)) != NULL) {
+                if (strcmp(entry->d_name, ".") != 0 && 
+                    strcmp(entry->d_name, "..") != 0) {
+                    usize name_length = strlen(entry->d_name);
+                    char* name = PushArray(arena, char, name_length + 1);
+                    strcpy(name, entry->d_name);
+                    result[index++] = name;
+                }
+            }
+            *count = entry_count;
+        }
+        
+        closedir(dir);
+    }
+    
+    return result;
+}
+
+// Threading functions
+static void* WorkerThreadProc(void* param) {
+    LinuxWorkQueue* queue = (LinuxWorkQueue*)param;
+    
+    while (queue->running) {
+        pthread_mutex_lock(&queue->mutex);
+        
+        while (queue->read_index == queue->write_index && queue->running) {
+            pthread_cond_wait(&queue->cond, &queue->mutex);
+        }
+        
+        if (!queue->running) {
+            pthread_mutex_unlock(&queue->mutex);
+            break;
+        }
+        
+        u32 read_index = queue->read_index;
+        PlatformWork work = queue->entries[read_index % 256];
+        queue->read_index = read_index + 1;
+        
+        pthread_mutex_unlock(&queue->mutex);
+        
+        if (work.proc) {
+            work.proc(work.data);
+        }
+        
+        __sync_fetch_and_add(&queue->completion_count, 1);
+    }
+    
+    return NULL;
+}
+
+static PlatformWorkQueue* LinuxCreateWorkQueue(u32 thread_count) {
+    LinuxWorkQueue* queue = (LinuxWorkQueue*)calloc(1, sizeof(LinuxWorkQueue));
+    
+    queue->entries = (PlatformWork*)calloc(256, sizeof(PlatformWork));
+    queue->threads = (pthread_t*)calloc(thread_count, sizeof(pthread_t));
+    queue->thread_count = thread_count;
+    queue->running = true;
+    
+    pthread_mutex_init(&queue->mutex, NULL);
+    pthread_cond_init(&queue->cond, NULL);
+    
+    for (u32 i = 0; i < thread_count; i++) {
+        pthread_create(&queue->threads[i], NULL, WorkerThreadProc, queue);
+    }
+    
+    return (PlatformWorkQueue*)queue;
+}
+
+static void LinuxPushWork(PlatformWorkQueue* platform_queue, PlatformWorkProc proc, void* data) {
+    LinuxWorkQueue* queue = (LinuxWorkQueue*)platform_queue;
+    
+    pthread_mutex_lock(&queue->mutex);
+    
+    u32 write_index = queue->write_index;
+    queue->entries[write_index % 256].proc = proc;
+    queue->entries[write_index % 256].data = data;
+    queue->write_index = write_index + 1;
+    __sync_fetch_and_add(&queue->completion_goal, 1);
+    
+    pthread_cond_signal(&queue->cond);
+    pthread_mutex_unlock(&queue->mutex);
+}
+
+static void LinuxCompleteAllWork(PlatformWorkQueue* platform_queue) {
+    LinuxWorkQueue* queue = (LinuxWorkQueue*)platform_queue;
+    
+    while (queue->completion_count < queue->completion_goal) {
+        // Help with work if needed
+        pthread_mutex_lock(&queue->mutex);
+        
+        if (queue->read_index < queue->write_index) {
+            u32 read_index = queue->read_index;
+            PlatformWork work = queue->entries[read_index % 256];
+            queue->read_index = read_index + 1;
+            
+            pthread_mutex_unlock(&queue->mutex);
+            
+            if (work.proc) {
+                work.proc(work.data);
+            }
+            
+            __sync_fetch_and_add(&queue->completion_count, 1);
+        } else {
+            pthread_mutex_unlock(&queue->mutex);
+            usleep(100);
+        }
+    }
+}
+
+static void LinuxDestroyWorkQueue(PlatformWorkQueue* platform_queue) {
+    LinuxWorkQueue* queue = (LinuxWorkQueue*)platform_queue;
+    
+    queue->running = false;
+    pthread_cond_broadcast(&queue->cond);
+    
+    for (u32 i = 0; i < queue->thread_count; i++) {
+        pthread_join(queue->threads[i], NULL);
+    }
+    
+    pthread_mutex_destroy(&queue->mutex);
+    pthread_cond_destroy(&queue->cond);
+    
+    free(queue->entries);
+    free(queue->threads);
+    free(queue);
+}
+
+// Time functions
+static f64 LinuxGetTime(void) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    
+    f64 result = (now.tv_sec - g_linux_data.start_time.tv_sec) +
+                 (now.tv_nsec - g_linux_data.start_time.tv_nsec) * 1e-9;
+    return result;
+}
+
+static void LinuxSleep(f64 seconds) {
+    struct timespec req = {
+        .tv_sec = (time_t)seconds,
+        .tv_nsec = (long)((seconds - (time_t)seconds) * 1e9)
+    };
+    nanosleep(&req, NULL);
+}
+
+// Debug functions
+static void LinuxDebugPrint(const char* format, ...) {
+    va_list args;
+    va_start(args, format);
+    vprintf(format, args);
+    va_end(args);
+    fflush(stdout);
+}
+
+static void LinuxDebugBreak(void) {
+    __builtin_trap();
+}
+
+// Module loading functions
+static PlatformModule LinuxLoadModule(const char* path) {
+    PlatformModule module = {0};
+    
+    module.handle = dlopen(path, RTLD_NOW);
+    if (module.handle) {
+        module.Init = dlsym(module.handle, "AppInit");
+        module.Update = dlsym(module.handle, "AppUpdate");
+        module.Render = dlsym(module.handle, "AppRender");
+        module.Shutdown = dlsym(module.handle, "AppShutdown");
+        module.OnReload = dlsym(module.handle, "AppOnReload");
+        
+        struct stat file_stat;
+        if (stat(path, &file_stat) == 0) {
+            module.last_write_time = file_stat.st_mtime;
+        }
+        
+        module.valid = (module.Init && module.Update && module.Render);
+    }
+    
+    return module;
+}
+
+static void LinuxUnloadModule(PlatformModule* module) {
+    if (module->handle) {
+        dlclose(module->handle);
+        module->handle = NULL;
+        module->valid = false;
+    }
+}
+
+static bool LinuxReloadModule(PlatformModule* module, const char* path) {
+    struct stat file_stat;
+    if (stat(path, &file_stat) == 0) {
+        if (file_stat.st_mtime > module->last_write_time) {
+            LinuxUnloadModule(module);
+            *module = LinuxLoadModule(path);
+            return module->valid;
+        }
+    }
+    return false;
+}
+
+// Window functions
+static bool LinuxSetWindowTitle(const char* title) {
+    XStoreName(g_linux_data.display, g_linux_data.window, title);
+    XFlush(g_linux_data.display);
+    return true;
+}
+
+static bool LinuxSetWindowSize(u32 width, u32 height) {
+    XResizeWindow(g_linux_data.display, g_linux_data.window, width, height);
+    XFlush(g_linux_data.display);
+    g_platform.window.width = width;
+    g_platform.window.height = height;
+    return true;
+}
+
+static void LinuxShowCursor(bool show) {
+    if (show != g_linux_data.cursor_visible) {
+        if (show) {
+            XDefineCursor(g_linux_data.display, g_linux_data.window, None);
+        } else {
+            XDefineCursor(g_linux_data.display, g_linux_data.window, g_linux_data.hidden_cursor);
+        }
+        g_linux_data.cursor_visible = show;
+    }
+}
+
+static void LinuxSetCursorPosition(f32 x, f32 y) {
+    XWarpPointer(g_linux_data.display, None, g_linux_data.window,
+                 0, 0, 0, 0, (int)x, (int)y);
+    XFlush(g_linux_data.display);
+}
+
+static bool LinuxSetFullscreen(bool fullscreen) {
+    XEvent xev = {0};
+    Atom wm_state = XInternAtom(g_linux_data.display, "_NET_WM_STATE", False);
+    Atom wm_fullscreen = XInternAtom(g_linux_data.display, "_NET_WM_STATE_FULLSCREEN", False);
+    
+    xev.type = ClientMessage;
+    xev.xclient.window = g_linux_data.window;
+    xev.xclient.message_type = wm_state;
+    xev.xclient.format = 32;
+    xev.xclient.data.l[0] = fullscreen ? 1 : 0;
+    xev.xclient.data.l[1] = wm_fullscreen;
+    xev.xclient.data.l[2] = 0;
+    
+    XSendEvent(g_linux_data.display, DefaultRootWindow(g_linux_data.display),
+               False, SubstructureNotifyMask | SubstructureRedirectMask, &xev);
+    
+    g_linux_data.fullscreen = fullscreen;
+    return true;
+}
+
+// Clipboard functions
+static const char* LinuxGetClipboard(MemoryArena* arena) {
+    // Simplified clipboard implementation
+    return NULL;
+}
+
+static void LinuxSetClipboard(const char* text) {
+    // Simplified clipboard implementation
+}
+
+// Dialog functions
+static const char* LinuxOpenFileDialog(const char* filter, MemoryArena* arena) {
+    // Use zenity or kdialog if available
+    char command[1024];
+    snprintf(command, sizeof(command), "zenity --file-selection 2>/dev/null");
+    
+    FILE* pipe = popen(command, "r");
+    if (pipe) {
+        char buffer[1024];
+        if (fgets(buffer, sizeof(buffer), pipe)) {
+            // Remove newline
+            size_t len = strlen(buffer);
+            if (len > 0 && buffer[len-1] == '\n') {
+                buffer[len-1] = '\0';
+            }
+            
+            char* result = PushArray(arena, char, len + 1);
+            strcpy(result, buffer);
+            pclose(pipe);
+            return result;
+        }
+        pclose(pipe);
+    }
+    
+    return NULL;
+}
+
+static const char* LinuxSaveFileDialog(const char* filter, MemoryArena* arena) {
+    char command[1024];
+    snprintf(command, sizeof(command), "zenity --file-selection --save 2>/dev/null");
+    
+    FILE* pipe = popen(command, "r");
+    if (pipe) {
+        char buffer[1024];
+        if (fgets(buffer, sizeof(buffer), pipe)) {
+            size_t len = strlen(buffer);
+            if (len > 0 && buffer[len-1] == '\n') {
+                buffer[len-1] = '\0';
+            }
+            
+            char* result = PushArray(arena, char, len + 1);
+            strcpy(result, buffer);
+            pclose(pipe);
+            return result;
+        }
+        pclose(pipe);
+    }
+    
+    return NULL;
+}
+
+static void LinuxShowMessageBox(const char* title, const char* message) {
+    char command[2048];
+    snprintf(command, sizeof(command), 
+             "zenity --info --title=\"%s\" --text=\"%s\" 2>/dev/null",
+             title, message);
+    system(command);
+}
+
+// OpenGL functions
+static void LinuxSwapBuffers(void) {
+    glXSwapBuffers(g_linux_data.display, g_linux_data.window);
+}
+
+static bool LinuxMakeGLCurrent(void) {
+    return glXMakeCurrent(g_linux_data.display, g_linux_data.window, g_linux_data.gl_context);
+}
+
+static bool LinuxSetVSync(bool enable) {
+    typedef int (*PFNGLXSWAPINTERVALMESAPROC)(int interval);
+    PFNGLXSWAPINTERVALMESAPROC glXSwapIntervalMESA = 
+        (PFNGLXSWAPINTERVALMESAPROC)glXGetProcAddress((const GLubyte*)"glXSwapIntervalMESA");
+    
+    if (glXSwapIntervalMESA) {
+        glXSwapIntervalMESA(enable ? 1 : 0);
+        return true;
+    }
+    
+    typedef int (*PFNGLXSWAPINTERVALEXTPROC)(Display* dpy, GLXDrawable drawable, int interval);
+    PFNGLXSWAPINTERVALEXTPROC glXSwapIntervalEXT = 
+        (PFNGLXSWAPINTERVALEXTPROC)glXGetProcAddress((const GLubyte*)"glXSwapIntervalEXT");
+    
+    if (glXSwapIntervalEXT) {
+        glXSwapIntervalEXT(g_linux_data.display, g_linux_data.window, enable ? 1 : 0);
+        return true;
+    }
+    
+    return false;
+}
+
+static void* LinuxGetGLProcAddress(const char* name) {
+    return (void*)glXGetProcAddress((const GLubyte*)name);
+}
+
+// Input translation
+static KeyCode TranslateKeycode(KeySym keysym) {
+    switch (keysym) {
+        case XK_a: case XK_A: return KEY_A;
+        case XK_b: case XK_B: return KEY_B;
+        case XK_c: case XK_C: return KEY_C;
+        case XK_d: case XK_D: return KEY_D;
+        case XK_e: case XK_E: return KEY_E;
+        case XK_f: case XK_F: return KEY_F;
+        case XK_g: case XK_G: return KEY_G;
+        case XK_h: case XK_H: return KEY_H;
+        case XK_i: case XK_I: return KEY_I;
+        case XK_j: case XK_J: return KEY_J;
+        case XK_k: case XK_K: return KEY_K;
+        case XK_l: case XK_L: return KEY_L;
+        case XK_m: case XK_M: return KEY_M;
+        case XK_n: case XK_N: return KEY_N;
+        case XK_o: case XK_O: return KEY_O;
+        case XK_p: case XK_P: return KEY_P;
+        case XK_q: case XK_Q: return KEY_Q;
+        case XK_r: case XK_R: return KEY_R;
+        case XK_s: case XK_S: return KEY_S;
+        case XK_t: case XK_T: return KEY_T;
+        case XK_u: case XK_U: return KEY_U;
+        case XK_v: case XK_V: return KEY_V;
+        case XK_w: case XK_W: return KEY_W;
+        case XK_x: case XK_X: return KEY_X;
+        case XK_y: case XK_Y: return KEY_Y;
+        case XK_z: case XK_Z: return KEY_Z;
+        
+        case XK_0: case XK_KP_0: return KEY_0;
+        case XK_1: case XK_KP_1: return KEY_1;
+        case XK_2: case XK_KP_2: return KEY_2;
+        case XK_3: case XK_KP_3: return KEY_3;
+        case XK_4: case XK_KP_4: return KEY_4;
+        case XK_5: case XK_KP_5: return KEY_5;
+        case XK_6: case XK_KP_6: return KEY_6;
+        case XK_7: case XK_KP_7: return KEY_7;
+        case XK_8: case XK_KP_8: return KEY_8;
+        case XK_9: case XK_KP_9: return KEY_9;
+        
+        case XK_space: return KEY_SPACE;
+        case XK_Return: case XK_KP_Enter: return KEY_ENTER;
+        case XK_Tab: return KEY_TAB;
+        case XK_Escape: return KEY_ESCAPE;
+        case XK_BackSpace: return KEY_BACKSPACE;
+        case XK_Delete: return KEY_DELETE;
+        
+        case XK_Up: return KEY_UP;
+        case XK_Down: return KEY_DOWN;
+        case XK_Left: return KEY_LEFT;
+        case XK_Right: return KEY_RIGHT;
+        
+        case XK_F1: return KEY_F1;
+        case XK_F2: return KEY_F2;
+        case XK_F3: return KEY_F3;
+        case XK_F4: return KEY_F4;
+        case XK_F5: return KEY_F5;
+        case XK_F6: return KEY_F6;
+        case XK_F7: return KEY_F7;
+        case XK_F8: return KEY_F8;
+        case XK_F9: return KEY_F9;
+        case XK_F10: return KEY_F10;
+        case XK_F11: return KEY_F11;
+        case XK_F12: return KEY_F12;
+        
+        case XK_Shift_L: case XK_Shift_R: return KEY_SHIFT;
+        case XK_Control_L: case XK_Control_R: return KEY_CTRL;
+        case XK_Alt_L: case XK_Alt_R: return KEY_ALT;
+        case XK_Super_L: case XK_Super_R: return KEY_SUPER;
+        
+        default: return KEY_UNKNOWN;
+    }
+}
+
+// Event processing
+static void ProcessEvents(void) {
+    // Update previous input state
+    for (int i = 0; i < KEY_COUNT; i++) {
+        g_platform.input.keys[i].pressed = false;
+        g_platform.input.keys[i].released = false;
+    }
+    for (int i = 0; i < MOUSE_COUNT; i++) {
+        g_platform.input.mouse[i].pressed = false;
+        g_platform.input.mouse[i].released = false;
+    }
+    
+    g_platform.input.mouse_dx = 0;
+    g_platform.input.mouse_dy = 0;
+    g_platform.input.mouse_wheel = 0;
+    g_platform.input.text_length = 0;
+    g_platform.window.resized = false;
+    
+    XEvent event;
+    while (XPending(g_linux_data.display)) {
+        XNextEvent(g_linux_data.display, &event);
+        
+        switch (event.type) {
+            case ClientMessage: {
+                if ((Atom)event.xclient.data.l[0] == g_linux_data.wm_delete_window) {
+                    g_platform.window.should_close = true;
+                }
+            } break;
+            
+            case ConfigureNotify: {
+                if (event.xconfigure.width != g_platform.window.width ||
+                    event.xconfigure.height != g_platform.window.height) {
+                    g_platform.window.width = event.xconfigure.width;
+                    g_platform.window.height = event.xconfigure.height;
+                    g_platform.window.resized = true;
+                }
+            } break;
+            
+            case KeyPress: {
+                KeySym keysym = XLookupKeysym(&event.xkey, 0);
+                KeyCode key = TranslateKeycode(keysym);
+                if (key != KEY_UNKNOWN) {
+                    g_platform.input.keys[key].down = true;
+                    g_platform.input.keys[key].pressed = true;
+                    g_platform.input.keys[key].transitions++;
+                }
+                
+                // Text input
+                if (g_linux_data.input_context) {
+                    char buffer[32];
+                    Status status;
+                    int len = Xutf8LookupString(g_linux_data.input_context, &event.xkey,
+                                               buffer, sizeof(buffer)-1, NULL, &status);
+                    if (len > 0 && status == XLookupChars) {
+                        memcpy(g_platform.input.text_input, buffer, len);
+                        g_platform.input.text_input[len] = 0;
+                        g_platform.input.text_length = len;
+                    }
+                }
+            } break;
+            
+            case KeyRelease: {
+                // Check for key repeat
+                if (XEventsQueued(g_linux_data.display, QueuedAfterReading)) {
+                    XEvent next;
+                    XPeekEvent(g_linux_data.display, &next);
+                    if (next.type == KeyPress && next.xkey.time == event.xkey.time &&
+                        next.xkey.keycode == event.xkey.keycode) {
+                        // Key repeat - skip this release
+                        break;
+                    }
+                }
+                
+                KeySym keysym = XLookupKeysym(&event.xkey, 0);
+                KeyCode key = TranslateKeycode(keysym);
+                if (key != KEY_UNKNOWN) {
+                    g_platform.input.keys[key].down = false;
+                    g_platform.input.keys[key].released = true;
+                    g_platform.input.keys[key].transitions++;
+                }
+            } break;
+            
+            case ButtonPress: {
+                switch (event.xbutton.button) {
+                    case Button1:
+                        g_platform.input.mouse[MOUSE_LEFT].down = true;
+                        g_platform.input.mouse[MOUSE_LEFT].pressed = true;
+                        g_platform.input.mouse[MOUSE_LEFT].transitions++;
+                        break;
+                    case Button2:
+                        g_platform.input.mouse[MOUSE_MIDDLE].down = true;
+                        g_platform.input.mouse[MOUSE_MIDDLE].pressed = true;
+                        g_platform.input.mouse[MOUSE_MIDDLE].transitions++;
+                        break;
+                    case Button3:
+                        g_platform.input.mouse[MOUSE_RIGHT].down = true;
+                        g_platform.input.mouse[MOUSE_RIGHT].pressed = true;
+                        g_platform.input.mouse[MOUSE_RIGHT].transitions++;
+                        break;
+                    case Button4:
+                        g_platform.input.mouse_wheel = 1.0f;
+                        break;
+                    case Button5:
+                        g_platform.input.mouse_wheel = -1.0f;
+                        break;
+                }
+            } break;
+            
+            case ButtonRelease: {
+                switch (event.xbutton.button) {
+                    case Button1:
+                        g_platform.input.mouse[MOUSE_LEFT].down = false;
+                        g_platform.input.mouse[MOUSE_LEFT].released = true;
+                        g_platform.input.mouse[MOUSE_LEFT].transitions++;
+                        break;
+                    case Button2:
+                        g_platform.input.mouse[MOUSE_MIDDLE].down = false;
+                        g_platform.input.mouse[MOUSE_MIDDLE].released = true;
+                        g_platform.input.mouse[MOUSE_MIDDLE].transitions++;
+                        break;
+                    case Button3:
+                        g_platform.input.mouse[MOUSE_RIGHT].down = false;
+                        g_platform.input.mouse[MOUSE_RIGHT].released = true;
+                        g_platform.input.mouse[MOUSE_RIGHT].transitions++;
+                        break;
+                }
+            } break;
+            
+            case MotionNotify: {
+                f32 new_x = event.xmotion.x;
+                f32 new_y = event.xmotion.y;
+                g_platform.input.mouse_dx = new_x - g_platform.input.mouse_x;
+                g_platform.input.mouse_dy = new_y - g_platform.input.mouse_y;
+                g_platform.input.mouse_x = new_x;
+                g_platform.input.mouse_y = new_y;
+            } break;
+            
+            case FocusIn: {
+                g_platform.window.focused = true;
+            } break;
+            
+            case FocusOut: {
+                g_platform.window.focused = false;
+            } break;
+        }
+    }
+}
+
+// Window initialization
+static bool InitializeWindow(u32 width, u32 height, const char* title) {
+    g_linux_data.display = XOpenDisplay(NULL);
+    if (!g_linux_data.display) {
+        fprintf(stderr, "Failed to open X display\n");
+        return false;
+    }
+    
+    int screen = DefaultScreen(g_linux_data.display);
+    Window root = RootWindow(g_linux_data.display, screen);
+    
+    // Choose visual
+    static int visual_attribs[] = {
+        GLX_X_RENDERABLE, True,
+        GLX_DRAWABLE_TYPE, GLX_WINDOW_BIT,
+        GLX_RENDER_TYPE, GLX_RGBA_BIT,
+        GLX_X_VISUAL_TYPE, GLX_TRUE_COLOR,
+        GLX_RED_SIZE, 8,
+        GLX_GREEN_SIZE, 8,
+        GLX_BLUE_SIZE, 8,
+        GLX_ALPHA_SIZE, 8,
+        GLX_DEPTH_SIZE, 24,
+        GLX_STENCIL_SIZE, 8,
+        GLX_DOUBLEBUFFER, True,
+        None
+    };
+    
+    int fbcount;
+    GLXFBConfig* fbc = glXChooseFBConfig(g_linux_data.display, screen, visual_attribs, &fbcount);
+    if (!fbc) {
+        fprintf(stderr, "Failed to retrieve framebuffer config\n");
+        return false;
+    }
+    
+    GLXFBConfig bestFbc = fbc[0];
+    XFree(fbc);
+    
+    XVisualInfo* vi = glXGetVisualFromFBConfig(g_linux_data.display, bestFbc);
+    
+    // Create window
+    XSetWindowAttributes swa;
+    swa.colormap = XCreateColormap(g_linux_data.display, root, vi->visual, AllocNone);
+    swa.background_pixmap = None;
+    swa.border_pixel = 0;
+    swa.event_mask = StructureNotifyMask | KeyPressMask | KeyReleaseMask |
+                     ButtonPressMask | ButtonReleaseMask | PointerMotionMask |
+                     FocusChangeMask | ExposureMask;
+    
+    g_linux_data.window = XCreateWindow(g_linux_data.display, root,
+                                        0, 0, width, height, 0,
+                                        vi->depth, InputOutput, vi->visual,
+                                        CWBorderPixel | CWColormap | CWEventMask,
+                                        &swa);
+    
+    if (!g_linux_data.window) {
+        fprintf(stderr, "Failed to create window\n");
+        return false;
+    }
+    
+    XFree(vi);
+    
+    // Set window properties
+    XStoreName(g_linux_data.display, g_linux_data.window, title);
+    
+    g_linux_data.wm_delete_window = XInternAtom(g_linux_data.display, "WM_DELETE_WINDOW", False);
+    XSetWMProtocols(g_linux_data.display, g_linux_data.window, &g_linux_data.wm_delete_window, 1);
+    
+    // Create OpenGL context
+    typedef GLXContext (*glXCreateContextAttribsARBProc)(Display*, GLXFBConfig, GLXContext, Bool, const int*);
+    glXCreateContextAttribsARBProc glXCreateContextAttribsARB = 
+        (glXCreateContextAttribsARBProc)glXGetProcAddress((const GLubyte*)"glXCreateContextAttribsARB");
+    
+    if (glXCreateContextAttribsARB) {
+        int context_attribs[] = {
+            GLX_CONTEXT_MAJOR_VERSION_ARB, 3,
+            GLX_CONTEXT_MINOR_VERSION_ARB, 3,
+            GLX_CONTEXT_FLAGS_ARB, GLX_CONTEXT_FORWARD_COMPATIBLE_BIT_ARB,
+            None
+        };
+        
+        g_linux_data.gl_context = glXCreateContextAttribsARB(g_linux_data.display, bestFbc, 0,
+                                                             True, context_attribs);
+    } else {
+        g_linux_data.gl_context = glXCreateNewContext(g_linux_data.display, bestFbc, GLX_RGBA_TYPE, 0, True);
+    }
+    
+    if (!g_linux_data.gl_context) {
+        fprintf(stderr, "Failed to create OpenGL context\n");
+        return false;
+    }
+    
+    // Setup input method
+    g_linux_data.input_method = XOpenIM(g_linux_data.display, NULL, NULL, NULL);
+    if (g_linux_data.input_method) {
+        g_linux_data.input_context = XCreateIC(g_linux_data.input_method,
+                                              XNInputStyle, XIMPreeditNothing | XIMStatusNothing,
+                                              XNClientWindow, g_linux_data.window,
+                                              NULL);
+    }
+    
+    // Create hidden cursor
+    Pixmap blank;
+    XColor dummy;
+    char data[1] = {0};
+    blank = XCreateBitmapFromData(g_linux_data.display, g_linux_data.window, data, 1, 1);
+    g_linux_data.hidden_cursor = XCreatePixmapCursor(g_linux_data.display, blank, blank,
+                                                     &dummy, &dummy, 0, 0);
+    XFreePixmap(g_linux_data.display, blank);
+    
+    // Show window
+    XMapWindow(g_linux_data.display, g_linux_data.window);
+    XFlush(g_linux_data.display);
+    
+    // Initialize window state
+    g_platform.window.width = width;
+    g_platform.window.height = height;
+    g_platform.window.focused = true;
+    g_platform.window.dpi_scale = 1.0f;
+    
+    return true;
+}
+
+// Initialize platform API
+static void InitializePlatformAPI(void) {
+    g_platform_api.AllocateMemory = LinuxAllocateMemory;
+    g_platform_api.FreeMemory = LinuxFreeMemory;
+    g_platform_api.CopyMemory = LinuxCopyMemory;
+    g_platform_api.ZeroMemory = LinuxZeroMemory;
+    
+    g_platform_api.ReadFile = LinuxReadFile;
+    g_platform_api.WriteFile = LinuxWriteFile;
+    g_platform_api.FileExists = LinuxFileExists;
+    g_platform_api.GetFileTime = LinuxGetFileTime;
+    g_platform_api.DeleteFile = LinuxDeleteFile;
+    g_platform_api.CreateDirectory = LinuxCreateDirectory;
+    g_platform_api.ListDirectory = LinuxListDirectory;
+    
+    g_platform_api.CreateWorkQueue = LinuxCreateWorkQueue;
+    g_platform_api.PushWork = LinuxPushWork;
+    g_platform_api.CompleteAllWork = LinuxCompleteAllWork;
+    g_platform_api.DestroyWorkQueue = LinuxDestroyWorkQueue;
+    
+    g_platform_api.GetTime = LinuxGetTime;
+    g_platform_api.Sleep = LinuxSleep;
+    
+    g_platform_api.DebugPrint = LinuxDebugPrint;
+    g_platform_api.DebugBreak = LinuxDebugBreak;
+    
+    g_platform_api.LoadModule = LinuxLoadModule;
+    g_platform_api.UnloadModule = LinuxUnloadModule;
+    g_platform_api.ReloadModule = LinuxReloadModule;
+    
+    g_platform_api.SetWindowTitle = LinuxSetWindowTitle;
+    g_platform_api.SetWindowSize = LinuxSetWindowSize;
+    g_platform_api.ShowCursor = LinuxShowCursor;
+    g_platform_api.SetCursorPosition = LinuxSetCursorPosition;
+    g_platform_api.SetFullscreen = LinuxSetFullscreen;
+    
+    g_platform_api.GetClipboard = LinuxGetClipboard;
+    g_platform_api.SetClipboard = LinuxSetClipboard;
+    
+    g_platform_api.OpenFileDialog = LinuxOpenFileDialog;
+    g_platform_api.SaveFileDialog = LinuxSaveFileDialog;
+    g_platform_api.ShowMessageBox = LinuxShowMessageBox;
+    
+    g_platform.gl.GetProcAddress = LinuxGetGLProcAddress;
+    g_platform.gl.SwapBuffers = LinuxSwapBuffers;
+    g_platform.gl.MakeCurrent = LinuxMakeGLCurrent;
+    g_platform.gl.SetVSync = LinuxSetVSync;
+}
+
+// Main entry point
+int main(int argc, char** argv) {
+    // Initialize time
+    clock_gettime(CLOCK_MONOTONIC, &g_linux_data.start_time);
+    
+    // Initialize platform API
+    InitializePlatformAPI();
+    
+    // Allocate memory
+    g_platform.permanent_memory.size = GIGABYTES(1);
+    g_platform.permanent_memory.memory = LinuxAllocateMemory(g_platform.permanent_memory.size);
+    if (!g_platform.permanent_memory.memory) {
+        fprintf(stderr, "Failed to allocate permanent memory\n");
+        return 1;
+    }
+    
+    g_platform.transient_memory.size = MEGABYTES(512);
+    g_platform.transient_memory.memory = LinuxAllocateMemory(g_platform.transient_memory.size);
+    if (!g_platform.transient_memory.memory) {
+        fprintf(stderr, "Failed to allocate transient memory\n");
+        return 1;
+    }
+    
+    // Initialize memory arenas
+    g_platform.permanent_arena.base = (u8*)g_platform.permanent_memory.memory;
+    g_platform.permanent_arena.size = g_platform.permanent_memory.size;
+    g_platform.permanent_arena.used = 0;
+    
+    g_platform.frame_arena.base = (u8*)g_platform.transient_memory.memory;
+    g_platform.frame_arena.size = g_platform.transient_memory.size;
+    g_platform.frame_arena.used = 0;
+    
+    // Initialize window
+    if (!InitializeWindow(1920, 1080, "Handmade Editor")) {
+        return 1;
+    }
+    
+    // Make GL context current
+    glXMakeCurrent(g_linux_data.display, g_linux_data.window, g_linux_data.gl_context);
+    LinuxSetVSync(true);
+    
+    // Initialize work queue
+    g_platform.thread_count = sysconf(_SC_NPROCESSORS_ONLN);
+    g_platform.work_queue = LinuxCreateWorkQueue(g_platform.thread_count - 1);
+    
+    // Load game module if using hot reload
+    bool hot_reload = false;
+    const char* module_path = "./editor.so";
+    
+    if (argc > 1 && strcmp(argv[1], "--hot-reload") == 0) {
+        hot_reload = true;
+        g_platform.game_module = LinuxLoadModule(module_path);
+        if (!g_platform.game_module.valid) {
+            fprintf(stderr, "Failed to load game module\n");
+            hot_reload = false;
+        }
+    }
+    
+    // Set up file watching for hot reload
+    if (hot_reload) {
+        g_linux_data.inotify_fd = inotify_init1(IN_NONBLOCK);
+        if (g_linux_data.inotify_fd >= 0) {
+            g_linux_data.watch_fd = inotify_add_watch(g_linux_data.inotify_fd, ".", IN_MODIFY);
+        }
+    }
+    
+    // Initialize app
+    if (hot_reload && g_platform.game_module.valid) {
+        g_platform.game_module.Init(&g_platform);
+    } else {
+        AppInit(&g_platform);
+    }
+    
+    // Main loop
+    g_linux_data.running = true;
+    f64 last_time = LinuxGetTime();
+    
+    while (g_linux_data.running && !g_platform.window.should_close) {
+        // Clear frame arena
+        ClearArena(&g_platform.frame_arena);
+        
+        // Handle events
+        ProcessEvents();
+        
+        // Calculate time delta
+        f64 current_time = LinuxGetTime();
+        f32 dt = (f32)(current_time - last_time);
+        last_time = current_time;
+        
+        g_platform.time.elapsed_seconds = current_time;
+        g_platform.time.delta_seconds = dt;
+        g_platform.time.frame_count++;
+        
+        // Check for hot reload
+        if (hot_reload && g_linux_data.inotify_fd >= 0) {
+            char buffer[1024];
+            ssize_t len = read(g_linux_data.inotify_fd, buffer, sizeof(buffer));
+            if (len > 0) {
+                if (LinuxReloadModule(&g_platform.game_module, module_path)) {
+                    if (g_platform.game_module.OnReload) {
+                        g_platform.game_module.OnReload(&g_platform);
+                    }
+                }
+            }
+        }
+        
+        // Update and render
+        if (hot_reload && g_platform.game_module.valid) {
+            g_platform.game_module.Update(&g_platform, dt);
+            g_platform.game_module.Render(&g_platform);
+        } else {
+            AppUpdate(&g_platform, dt);
+            AppRender(&g_platform);
+        }
+        
+        // Swap buffers
+        LinuxSwapBuffers();
+    }
+    
+    // Shutdown
+    if (hot_reload && g_platform.game_module.valid) {
+        g_platform.game_module.Shutdown(&g_platform);
+        LinuxUnloadModule(&g_platform.game_module);
+    } else {
+        AppShutdown(&g_platform);
+    }
+    
+    // Cleanup
+    LinuxDestroyWorkQueue(g_platform.work_queue);
+    
+    if (g_linux_data.inotify_fd >= 0) {
+        close(g_linux_data.inotify_fd);
+    }
+    
+    if (g_linux_data.input_context) {
+        XDestroyIC(g_linux_data.input_context);
+    }
+    if (g_linux_data.input_method) {
+        XCloseIM(g_linux_data.input_method);
+    }
+    
+    glXMakeCurrent(g_linux_data.display, None, NULL);
+    glXDestroyContext(g_linux_data.display, g_linux_data.gl_context);
+    XDestroyWindow(g_linux_data.display, g_linux_data.window);
+    XCloseDisplay(g_linux_data.display);
+    
+    munmap(g_platform.permanent_memory.memory, g_platform.permanent_memory.size);
+    munmap(g_platform.transient_memory.memory, g_platform.transient_memory.size);
+    
+    return 0;
+}

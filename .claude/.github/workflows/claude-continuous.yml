@@ -1,0 +1,46 @@
+# .github/workflows/claude-continuous.yml
+name: Continuous Claude Development
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'  # Every 30 minutes
+  workflow_dispatch:
+
+jobs:
+  continuous-development:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+        
+      - name: Update Context
+        run: ./update_state.sh
+        
+      - name: Get Next Task
+        run: |
+          TASK=$(head -n 1 TODO.md)
+          echo "CURRENT_TASK=$TASK" >> $GITHUB_ENV
+          
+      - name: Force Claude to Complete Task
+        run: |
+          ./drill_sergeant.py "$CURRENT_TASK"
+        timeout-minutes: 60
+        
+      - name: Verify Solution
+        run: |
+          ./build.sh
+          ./test.sh
+          ./benchmark.sh
+          
+      - name: Commit if Successful
+        run: |
+          git add -A
+          git commit -m "Claude solved: $CURRENT_TASK"
+          git push
+          
+      - name: Update TODO
+        run: |
+          tail -n +2 TODO.md > TODO.tmp
+          mv TODO.tmp TODO.md
+          git commit -m "Update TODO"
+          git push

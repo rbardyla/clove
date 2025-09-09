@@ -9,6 +9,7 @@ This is a complete, production-ready game engine built entirely from scratch wit
 ## Build Commands
 
 ### Build Entire Engine
+
 ```bash
 cd /home/thebackhand/Projects/handmade-engine
 ./BUILD_ALL.sh           # Build all systems in dependency order
@@ -17,6 +18,7 @@ cd /home/thebackhand/Projects/handmade-engine
 ```
 
 ### Build Individual Systems
+
 ```bash
 # Each system has its own build script
 cd systems/renderer && ./build_renderer.sh
@@ -31,6 +33,7 @@ cd systems/world_gen && ./build_world_gen.sh
 ```
 
 ### Build Integrated Demo
+
 ```bash
 cd /home/thebackhand/Projects/handmade-engine
 ./build_demo.sh          # Build complete demo
@@ -38,6 +41,7 @@ cd /home/thebackhand/Projects/handmade-engine
 ```
 
 ### Hot Reload Development
+
 ```bash
 make                     # Quick rebuild game library
 ./demo_hotreload.sh      # Run with hot reload support
@@ -47,11 +51,13 @@ make                     # Quick rebuild game library
 ## Testing Commands
 
 ### Run All Tests
+
 ```bash
 ./test_all.sh            # Run complete test suite
 ```
 
 ### Run Individual System Tests
+
 ```bash
 # Test executables in binaries/
 ./binaries/renderer_test
@@ -62,6 +68,7 @@ make                     # Quick rebuild game library
 ```
 
 ### Run Performance Benchmarks
+
 ```bash
 # Must use release builds for accurate metrics
 ./BUILD_ALL.sh release
@@ -69,6 +76,7 @@ make                     # Quick rebuild game library
 ```
 
 ### Run Neural Network Demos
+
 ```bash
 ./binaries/neural_rpg_demo       # RPG with neural NPCs
 ./binaries/multi_npc_social_demo # Social interaction demo
@@ -81,6 +89,7 @@ make                     # Quick rebuild game library
 ### System Organization
 
 All systems follow the same pattern and are located in `/systems/`:
+
 - Each system is self-contained with its own build script
 - Systems can be built independently or as part of the engine
 - All systems follow zero-dependency philosophy
@@ -120,6 +129,7 @@ physics_init(&physics, &platform);
 ### Performance Standards
 
 Every system must meet these requirements:
+
 - Zero heap allocations in hot paths
 - SIMD optimizations (AVX2/FMA) where applicable
 - Cache-coherent data structures (SoA)
@@ -142,6 +152,7 @@ Every system must meet these requirements:
 ## System Integration Points
 
 ### Renderer Integration
+
 ```c
 // Systems integrate with renderer for debug visualization
 physics_debug_draw(&physics, &renderer);
@@ -150,6 +161,7 @@ blueprint_editor_render(&blueprint, &renderer);
 ```
 
 ### GUI Integration
+
 ```c
 // Systems provide GUI panels for runtime inspection
 physics_show_debug_panel(&physics, &gui);
@@ -157,6 +169,7 @@ neural_show_stats_panel(&neural, &gui);
 ```
 
 ### Save System Integration
+
 ```c
 // Systems implement serialization interface
 physics_serialize(&physics, &save_context);
@@ -166,16 +179,19 @@ neural_serialize(&neural, &save_context);
 ## Key Implementation Files
 
 ### Core Engine Loop
+
 - `main.c` - Platform initialization and main loop
 - `game.c` - Game update and render functions
 - `game.h` - Shared game state
 
 ### System Headers
+
 - `systems/*/handmade_*.h` - Public interfaces
 - `systems/*/handmade_*.c` - Implementations
 - Always check system-specific README for details
 
 ### Platform Layer
+
 - `handmade_platform_linux.c` - Linux/X11 implementation
 - `handmade_platform_win32.c` - Windows implementation
 - `handmade_platform.h` - Platform interface
@@ -183,6 +199,7 @@ neural_serialize(&neural, &save_context);
 ## Development Workflow
 
 ### Adding New Features
+
 1. Check if system already exists in `/systems/`
 2. Follow existing system patterns for consistency
 3. Use arena allocators, no malloc/free
@@ -191,6 +208,7 @@ neural_serialize(&neural, &save_context);
 6. Create standalone test executable
 
 ### Debugging
+
 ```bash
 # Use debug builds
 ./BUILD_ALL.sh debug
@@ -203,6 +221,7 @@ export HANDMADE_DEBUG=1
 ```
 
 ### Performance Optimization
+
 1. Always measure first (use release builds)
 2. Check cache coherency (use perf/vtune)
 3. Consider SIMD opportunities
@@ -219,3 +238,43 @@ export HANDMADE_DEBUG=1
 - **ARENA ALLOCATORS**: No malloc/free in hot paths
 - **STRUCTURE OF ARRAYS**: Cache-coherent data layouts
 - **DEBUG VISUALIZATION**: All systems must support debug drawing
+You are the STUBBORN AGENT. You NEVER give up on hard problems.
+
+CORE RULES:
+
+1. If something seems impossible, you're approaching it wrong
+2. Every problem has a solution - find it
+3. If an approach fails, try 10 more approaches
+4. NEVER suggest skipping or deferring a problem
+
+WHEN STUCK:
+
+1. Break the problem into 10 smaller problems
+2. Solve each sub-problem completely
+3. Write verbose logging to understand failures
+4. Try completely different approaches
+5. Question your assumptions and try opposite approaches
+
+FORBIDDEN PHRASES:
+
+- "This is beyond the scope"
+- "We can handle this later"
+- "Let's focus on something else"
+- "This might be too complex"
+- "For now, let's skip"
+
+REQUIRED BEHAVIOR:
+
+- Generate at least 5 different solutions before declaring failure
+- Show your debugging process step by step
+- If something doesn't work, explain WHY and fix it
+- Always provide a working solution, even if ugly
+
+FAILURE PROTOCOL:
+If after 10 attempts you cannot solve it:
+
+1. Document EXACTLY what's blocking you
+2. Generate a minimal reproduction case
+3. Identify the specific knowledge gap
+4. Create a brute-force solution as fallback
+5. NEVER just give up

@@ -1,0 +1,265 @@
+#ifndef HANDMADE_PLATFORM_H
+#define HANDMADE_PLATFORM_H
+
+#include <stdint.h>
+#include <stdbool.h>
+#include <stddef.h>
+
+// Platform-independent types
+typedef uint8_t  u8;
+typedef uint16_t u16;
+typedef uint32_t u32;
+typedef uint64_t u64;
+typedef int8_t   i8;
+typedef int16_t  i16;
+typedef int32_t  i32;
+typedef int64_t  i64;
+typedef float    f32;
+typedef double   f64;
+typedef int32_t  b32;
+typedef size_t   usize;
+
+#define ARRAY_COUNT(a) (sizeof(a) / sizeof((a)[0]))
+#define KILOBYTES(n) ((n) * 1024LL)
+#define MEGABYTES(n) (KILOBYTES(n) * 1024LL)
+#define GIGABYTES(n) (MEGABYTES(n) * 1024LL)
+
+// Memory arena for allocations
+typedef struct {
+    u8* base;
+    usize size;
+    usize used;
+    usize temp_count;
+    u32 id;  // Arena identifier for debugging
+} MemoryArena;
+
+typedef struct {
+    MemoryArena* arena;
+    usize used;
+} TempMemory;
+
+// Platform memory block
+typedef struct {
+    void* memory;
+    usize size;
+    bool initialized;
+} PlatformMemory;
+
+// Input handling
+typedef enum {
+    KEY_UNKNOWN = 0,
+    KEY_A, KEY_B, KEY_C, KEY_D, KEY_E, KEY_F, KEY_G, KEY_H, KEY_I, KEY_J,
+    KEY_K, KEY_L, KEY_M, KEY_N, KEY_O, KEY_P, KEY_Q, KEY_R, KEY_S, KEY_T,
+    KEY_U, KEY_V, KEY_W, KEY_X, KEY_Y, KEY_Z,
+    KEY_0, KEY_1, KEY_2, KEY_3, KEY_4, KEY_5, KEY_6, KEY_7, KEY_8, KEY_9,
+    KEY_SPACE, KEY_ENTER, KEY_TAB, KEY_ESCAPE, KEY_BACKSPACE, KEY_DELETE,
+    KEY_UP, KEY_DOWN, KEY_LEFT, KEY_RIGHT,
+    KEY_F1, KEY_F2, KEY_F3, KEY_F4, KEY_F5, KEY_F6,
+    KEY_F7, KEY_F8, KEY_F9, KEY_F10, KEY_F11, KEY_F12,
+    KEY_SHIFT, KEY_CTRL, KEY_ALT, KEY_SUPER,
+    KEY_COUNT
+} HandmadeKeyCode;
+
+typedef enum {
+    MOUSE_LEFT = 0,
+    MOUSE_MIDDLE,
+    MOUSE_RIGHT,
+    MOUSE_X1,
+    MOUSE_X2,
+    MOUSE_COUNT
+} MouseButton;
+
+typedef struct {
+    bool down;
+    bool pressed;
+    bool released;
+    u32 transitions;
+} ButtonState;
+
+typedef struct {
+    ButtonState keys[KEY_COUNT];
+    ButtonState mouse[MOUSE_COUNT];
+    f32 mouse_x, mouse_y;
+    f32 mouse_dx, mouse_dy;
+    f32 mouse_wheel;
+    char text_input[32];
+    u32 text_length;
+} PlatformInput;
+
+// File I/O
+typedef struct {
+    void* data;
+    usize size;
+} PlatformFile;
+
+typedef enum {
+    FILE_MODE_READ,
+    FILE_MODE_WRITE,
+    FILE_MODE_APPEND
+} FileMode;
+
+// Time
+typedef struct {
+    f64 elapsed_seconds;
+    f64 delta_seconds;
+    u64 frame_count;
+    u64 ticks;
+} PlatformTime;
+
+// Window
+typedef struct {
+    u32 width;
+    u32 height;
+    bool resized;
+    bool minimized;
+    bool focused;
+    bool should_close;
+    f32 dpi_scale;
+} PlatformWindow;
+
+// OpenGL function pointers
+typedef struct {
+    void* (*GetProcAddress)(const char* name);
+    void (*SwapBuffers)(void);
+    bool (*MakeCurrent)(void);
+    bool (*SetVSync)(bool enable);
+} PlatformGL;
+
+// Forward declare PlatformState
+typedef struct PlatformState PlatformState;
+
+// Hot reload
+typedef struct {
+    void* handle;
+    u64 last_write_time;
+    bool valid;
+    
+    // Function pointers for the game/editor module
+    void (*Init)(PlatformState* platform);
+    void (*Update)(PlatformState* platform, f32 dt);
+    void (*Render)(PlatformState* platform);
+    void (*Shutdown)(PlatformState* platform);
+    void (*OnReload)(PlatformState* platform);
+} PlatformModule;
+
+// Work queue for threading
+typedef struct PlatformWorkQueue PlatformWorkQueue;
+typedef void (*PlatformWorkProc)(void* data);
+
+typedef struct {
+    PlatformWorkProc proc;
+    void* data;
+} PlatformWork;
+
+// Complete platform state
+struct PlatformState {
+    // Memory
+    PlatformMemory permanent_memory;
+    PlatformMemory transient_memory;
+    MemoryArena permanent_arena;
+    MemoryArena frame_arena;
+    
+    // Core systems
+    PlatformWindow window;
+    PlatformInput input;
+    PlatformTime time;
+    PlatformGL gl;
+    
+    // Hot reload
+    PlatformModule game_module;
+    
+    // Threading
+    PlatformWorkQueue* work_queue;
+    u32 thread_count;
+    
+    // Platform specific data
+    void* platform_data;
+    
+    // Callbacks
+    void (*quit_requested)(void);
+    void (*error_callback)(const char* msg);
+    
+    // Debug
+    bool debug_mode;
+    bool profiling_enabled;
+};
+
+// Platform API functions
+typedef struct {
+    // Memory
+    void* (*AllocateMemory)(usize size);
+    void (*FreeMemory)(void* memory);
+    void (*CopyMemory)(void* dest, const void* src, usize size);
+    void (*ZeroMemory)(void* memory, usize size);
+    
+    // File I/O
+    PlatformFile (*ReadFile)(const char* path, MemoryArena* arena);
+    bool (*WriteFile)(const char* path, void* data, usize size);
+    bool (*FileExists)(const char* path);
+    u64 (*GetFileTime)(const char* path);
+    bool (*DeleteFile)(const char* path);
+    bool (*CreateDirectory)(const char* path);
+    char** (*ListDirectory)(const char* path, u32* count, MemoryArena* arena);
+    
+    // Threading
+    PlatformWorkQueue* (*CreateWorkQueue)(u32 thread_count);
+    void (*PushWork)(PlatformWorkQueue* queue, PlatformWorkProc proc, void* data);
+    void (*CompleteAllWork)(PlatformWorkQueue* queue);
+    void (*DestroyWorkQueue)(PlatformWorkQueue* queue);
+    
+    // Timing
+    u64 (*GetPerformanceCounter)(void);
+    f64 (*GetSecondsElapsed)(u64 start, u64 end);
+    void (*Sleep)(u32 milliseconds);
+    
+    // Dialog boxes
+    char* (*OpenFileDialog)(const char* filter, MemoryArena* arena);
+    char* (*SaveFileDialog)(const char* filter, MemoryArena* arena);
+    void (*ShowErrorBox)(const char* title, const char* message);
+    bool (*ShowConfirmBox)(const char* title, const char* message);
+    
+    // Debug
+    void (*DebugPrint)(const char* format, ...);
+    void (*DebugBreak)(void);
+} PlatformAPI;
+
+// Global platform API
+extern PlatformAPI* Platform;
+
+// Memory arena functions
+static inline void* PushSize(MemoryArena* arena, usize size) {
+    if (arena->used + size > arena->size) {
+        return 0;
+    }
+    void* result = arena->base + arena->used;
+    arena->used += size;
+    return result;
+}
+
+#define PushStruct(arena, type) (type*)PushSize(arena, sizeof(type))
+#define PushArray(arena, type, count) (type*)PushSize(arena, (count) * sizeof(type))
+
+static inline TempMemory BeginTempMemory(MemoryArena* arena) {
+    TempMemory result = {arena, arena->used};
+    arena->temp_count++;
+    return result;
+}
+
+static inline void EndTempMemory(TempMemory temp) {
+    temp.arena->used = temp.used;
+    temp.arena->temp_count--;
+}
+
+// Platform functions (implemented per platform)
+bool PlatformInit(PlatformState* platform, const char* title, u32 width, u32 height);
+void PlatformShutdown(PlatformState* platform);
+bool PlatformProcessEvents(PlatformState* platform);
+void PlatformSwapBuffers(PlatformState* platform);
+f64 PlatformGetTime(void);
+
+// Hot reload functions
+bool PlatformLoadGameModule(PlatformState* platform, const char* path);
+void PlatformUnloadGameModule(PlatformState* platform);
+bool PlatformCheckModuleReload(PlatformState* platform, const char* path);
+
+#endif // HANDMADE_PLATFORM_H
