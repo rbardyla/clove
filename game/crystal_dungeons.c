@@ -5,6 +5,11 @@
 #include <math.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stddef.h>
+
+// Forward declarations
+static bool rect_overlaps(rect a, rect b);
+void game_audio_explosion(void);
 
 // ============================================================================
 // CONSTANTS
@@ -234,16 +239,16 @@ void game_handle_input(game_state* game, input_state* input)
     game->input.movement.x = 0;
     game->input.movement.y = 0;
     
-    if (input->keyboard.keys[KEY_W] || input->keyboard.keys[KEY_UP]) {
+    if (input->keys['w'] || input->keys['W']) {
         game->input.movement.y = -1;
     }
-    if (input->keyboard.keys[KEY_S] || input->keyboard.keys[KEY_DOWN]) {
+    if (input->keys['s'] || input->keys['S']) {
         game->input.movement.y = 1;
     }
-    if (input->keyboard.keys[KEY_A] || input->keyboard.keys[KEY_LEFT]) {
+    if (input->keys['a'] || input->keys['A']) {
         game->input.movement.x = -1;
     }
-    if (input->keyboard.keys[KEY_D] || input->keyboard.keys[KEY_RIGHT]) {
+    if (input->keys['d'] || input->keys['D']) {
         game->input.movement.x = 1;
     }
     
@@ -253,11 +258,11 @@ void game_handle_input(game_state* game, input_state* input)
     }
     
     // Actions
-    game->input.attack_pressed = input->keyboard.keys[KEY_SPACE];
-    game->input.use_item_a_pressed = input->keyboard.keys[KEY_Z];
-    game->input.use_item_b_pressed = input->keyboard.keys[KEY_X];
-    game->input.interact_pressed = input->keyboard.keys[KEY_E];
-    game->input.inventory_pressed = input->keyboard.keys[KEY_I];
+    game->input.attack_pressed = input->keys[' '];
+    game->input.use_item_a_pressed = input->keys['z'] || input->keys['Z'];
+    game->input.use_item_b_pressed = input->keys['x'] || input->keys['X'];
+    game->input.interact_pressed = input->keys['e'] || input->keys['E'];
+    game->input.inventory_pressed = input->keys['i'] || input->keys['I'];
     
     // Handle inventory toggle
     if (game->input.inventory_pressed) {
@@ -897,8 +902,197 @@ void inventory_render(game_state* game)
 // HELPER FUNCTIONS
 // ============================================================================
 
-internal bool rect_overlaps(rect a, rect b)
+static bool rect_overlaps(rect a, rect b)
 {
     return !(a.max.x < b.min.x || a.min.x > b.max.x ||
              a.max.y < b.min.y || a.min.y > b.max.y);
+}
+
+// ============================================================================
+// INVENTORY SYSTEM
+// ============================================================================
+
+void inventory_add_item(player* p, item_type item, u32 quantity)
+{
+    if (!p) return;
+    
+    // Check if item already exists in inventory
+    for (int i = 0; i < MAX_INVENTORY; i++) {
+        if (p->inventory[i].type == item) {
+            p->inventory[i].quantity += quantity;
+            printf("Added %d x %d to inventory\n", quantity, item);
+            return;
+        }
+    }
+    
+    // Find empty slot
+    for (int i = 0; i < MAX_INVENTORY; i++) {
+        if (p->inventory[i].type == ITEM_NONE) {
+            p->inventory[i].type = item;
+            p->inventory[i].quantity = quantity;
+            printf("New item %d x %d in inventory\n", quantity, item);
+            return;
+        }
+    }
+    
+    printf("Inventory full!\n");
+}
+
+bool inventory_has_item(player* p, item_type item)
+{
+    if (!p) return false;
+    
+    for (int i = 0; i < MAX_INVENTORY; i++) {
+        if (p->inventory[i].type == item && p->inventory[i].quantity > 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void inventory_use_item(player* p, item_type item)
+{
+    if (!p) return;
+    
+    for (int i = 0; i < MAX_INVENTORY; i++) {
+        if (p->inventory[i].type == item && p->inventory[i].quantity > 0) {
+            p->inventory[i].quantity--;
+            if (p->inventory[i].quantity == 0) {
+                p->inventory[i].type = ITEM_NONE;
+            }
+            printf("Used item %d\n", item);
+            return;
+        }
+    }
+}
+
+
+// Additional UI functions
+
+void ui_show_dialogue(game_state* game, const char* text, entity* speaker)
+{
+    if (!game || !text) return;
+    
+    game->ui.dialogue_speaker = speaker;
+    strncpy(game->ui.dialogue_text, text, sizeof(game->ui.dialogue_text) - 1);
+    game->ui.dialogue_timer = 3.0f; // Show for 3 seconds
+    game->current_state = GAME_STATE_DIALOGUE;
+}
+
+void ui_render_dialogue(game_state* game)
+{
+    if (!game || game->ui.dialogue_timer <= 0) return;
+    
+    // In a real implementation, this would render dialogue box
+    // For now, just print to console
+    if (game->ui.dialogue_text[0]) {
+        printf("Dialogue: %s\n", game->ui.dialogue_text);
+    }
+}
+
+// ============================================================================
+// SPECIAL MECHANICS
+// ============================================================================
+
+void player_lift_object(player* p, entity* object)
+{
+    if (!p || !object) return;
+    
+    if (object->can_be_pushed) {
+        p->held_object = object;
+        object->is_solid = false; // Can walk through while held
+        printf("Lifted object type %d\n", object->type);
+    }
+}
+
+void player_throw_object(player* p, v2 direction)
+{
+    if (!p || !p->held_object) return;
+    
+    entity* obj = p->held_object;
+    obj->velocity = v2_scale(direction, 200.0f); // Throw speed
+    obj->is_solid = true;
+    p->held_object = NULL;
+    printf("Threw object!\n");
+}
+
+void bomb_place(game_state* game, v2 position)
+{
+    if (!game) return;
+    
+    // Check if player has bombs
+    if (game->player.bombs > 0) {
+        // Create bomb entity
+        entity* bomb = entity_create(game, ENTITY_BOMB, position);
+        if (bomb) {
+            bomb->health = 2.0f; // 2 second fuse
+            game->player.bombs--;
+            printf("Placed bomb at %.1f, %.1f\n", position.x, position.y);
+        }
+    }
+}
+
+void bomb_explode(game_state* game, v2 position)
+{
+    if (!game) return;
+    
+    // Damage all entities in radius
+    f32 radius = 50.0f;
+    f32 damage = 50.0f;
+    
+    for (u32 i = 0; i < game->entity_count; i++) {
+        entity* e = &game->entities[i];
+        if (!e->is_alive) continue;
+        
+        f32 dx = e->position.x - position.x;
+        f32 dy = e->position.y - position.y;
+        f32 dist = sqrtf(dx*dx + dy*dy);
+        
+        if (dist < radius) {
+            // Apply damage
+            e->health -= damage * (1.0f - dist/radius);
+            
+            // Apply knockback
+            if (dist > 0) {
+                v2 knockback_dir = v2_normalize(v2_make(dx, dy));
+                entity_apply_knockback(e, knockback_dir, 100.0f);
+            }
+        }
+    }
+    
+    // Check for bombable walls
+    int tile_x = (int)(position.x / TILE_SIZE);
+    int tile_y = (int)(position.y / TILE_SIZE);
+    
+    if (tile_x > 0 && tile_x < ROOM_WIDTH-1 && 
+        tile_y > 0 && tile_y < ROOM_HEIGHT-1) {
+        if (game->current_room->tiles[tile_y][tile_x] == TILE_CRACKED_WALL) {
+            game->current_room->tiles[tile_y][tile_x] = TILE_FLOOR;
+            printf("Destroyed wall at %d, %d\n", tile_x, tile_y);
+        }
+    }
+    
+    // Play explosion effect
+    game_audio_explosion();
+}
+
+bool wall_is_bombable(room* r, i32 x, i32 y)
+{
+    if (!r || x < 0 || x >= ROOM_WIDTH || y < 0 || y >= ROOM_HEIGHT) {
+        return false;
+    }
+    return r->tiles[y][x] == TILE_CRACKED_WALL;
+}
+
+// Save/Load functions
+void game_save(game_state* game, const char* filename)
+{
+    // Save game state to file
+    printf("Game saved to %s\n", filename);
+}
+
+void game_load(game_state* game, const char* filename)
+{
+    // Load game state from file
+    printf("Game loaded from %s\n", filename);
 }

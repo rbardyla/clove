@@ -5,12 +5,7 @@
 #ifndef CRYSTAL_DUNGEONS_H
 #define CRYSTAL_DUNGEONS_H
 
-#include <stdint.h>
-#include <stdbool.h>
-#include "../src/handmade.h"
-#include "../systems/physics/handmade_physics.h"
-#include "../systems/ai/handmade_neural.h"
-#include "../systems/audio/handmade_audio.h"
+#include "game_types.h"
 
 // ============================================================================
 // GAME CONSTANTS
