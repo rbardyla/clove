@@ -1,0 +1,155 @@
+#ifndef RENDER_GRAPH_H
+#define RENDER_GRAPH_H
+
+#include "renderer.h"
+#include "memory.h"
+#include <stdint.h>
+
+// Forward declarations
+typedef struct RenderGraph RenderGraph;
+typedef struct RenderPass RenderPass;
+typedef struct RenderResource RenderResource;
+
+// Resource types in the render graph
+typedef enum ResourceType {
+    RESOURCE_TYPE_TEXTURE,
+    RESOURCE_TYPE_BUFFER,
+    RESOURCE_TYPE_RENDER_TARGET,
+} ResourceType;
+
+// Resource usage flags
+typedef enum ResourceUsage {
+    RESOURCE_USAGE_READ       = 0x01,
+    RESOURCE_USAGE_WRITE      = 0x02,
+    RESOURCE_USAGE_RENDER_TARGET = 0x04,
+    RESOURCE_USAGE_DEPTH_STENCIL = 0x08,
+    RESOURCE_USAGE_SHADER_RESOURCE = 0x10,
+    RESOURCE_USAGE_UNORDERED_ACCESS = 0x20,
+    RESOURCE_USAGE_COPY_SOURCE = 0x40,
+    RESOURCE_USAGE_COPY_DEST  = 0x80,
+} ResourceUsage;
+
+// Pass type
+typedef enum PassType {
+    PASS_TYPE_GRAPHICS,
+    PASS_TYPE_COMPUTE,
+    PASS_TYPE_COPY,
+    PASS_TYPE_ASYNC_COMPUTE,
+} PassType;
+
+// Resource descriptor
+typedef struct ResourceDesc {
+    const char* name;
+    ResourceType type;
+    union {
+        struct {
+            uint32_t width;
+            uint32_t height;
+            uint32_t depth;
+            TextureFormat format;
+            uint32_t mip_levels;
+            uint32_t array_size;
+            uint32_t sample_count;
+        } texture;
+        
+        struct {
+            size_t size;
+            uint32_t stride;
+            uint32_t count;
+        } buffer;
+    } data;
+    
+    ResourceUsage usage;
+    bool persistent;  // Keep across frames
+    bool imported;    // External resource
+} ResourceDesc;
+
+// Pass setup callback
+typedef void (*PassSetupFunc)(RenderGraph* graph, RenderPass* pass, void* user_data);
+// Pass execute callback  
+typedef void (*PassExecuteFunc)(Renderer* renderer, const RenderPass* pass, void* user_data);
+
+// Resource handle in the graph
+typedef struct ResourceHandle {
+    uint32_t id;
+    uint32_t version;
+} ResourceHandle;
+
+#define INVALID_RESOURCE_HANDLE ((ResourceHandle){0, 0})
+
+// Pass handle
+typedef struct PassHandle {
+    uint32_t id;
+} PassHandle;
+
+#define INVALID_PASS_HANDLE ((PassHandle){0})
+
+// Render graph API
+typedef struct RenderGraphAPI {
+    // Graph management
+    RenderGraph* (*create)(MemoryArena* arena, Renderer* renderer);
+    void (*destroy)(RenderGraph* graph);
+    void (*reset)(RenderGraph* graph);
+    
+    // Resource management
+    ResourceHandle (*create_texture)(RenderGraph* graph, const char* name, const ResourceDesc* desc);
+    ResourceHandle (*create_buffer)(RenderGraph* graph, const char* name, const ResourceDesc* desc);
+    ResourceHandle (*import_texture)(RenderGraph* graph, const char* name, TextureHandle texture);
+    ResourceHandle (*import_render_target)(RenderGraph* graph, const char* name, RenderTargetHandle target);
+    
+    // Pass management
+    PassHandle (*add_pass)(RenderGraph* graph, const char* name, PassType type, 
+                          PassSetupFunc setup, PassExecuteFunc execute, void* user_data);
+    void (*add_pass_read)(RenderGraph* graph, PassHandle pass, ResourceHandle resource);
+    void (*add_pass_write)(RenderGraph* graph, PassHandle pass, ResourceHandle resource);
+    void (*add_pass_render_target)(RenderGraph* graph, PassHandle pass, ResourceHandle resource);
+    void (*add_pass_depth_stencil)(RenderGraph* graph, PassHandle pass, ResourceHandle resource);
+    
+    // Compilation and execution
+    void (*compile)(RenderGraph* graph);
+    void (*execute)(RenderGraph* graph);
+    
+    // Debugging
+    void (*visualize)(RenderGraph* graph, const char* output_path);
+    void (*enable_profiling)(RenderGraph* graph, bool enable);
+    void (*get_pass_timing)(RenderGraph* graph, PassHandle pass, float* cpu_ms, float* gpu_ms);
+} RenderGraphAPI;
+
+// Global render graph API
+extern RenderGraphAPI* g_render_graph_api;
+
+// Convenience macros
+#define render_graph_create(...) g_render_graph_api->create(__VA_ARGS__)
+#define render_graph_add_pass(...) g_render_graph_api->add_pass(__VA_ARGS__)
+#define render_graph_compile(...) g_render_graph_api->compile(__VA_ARGS__)
+#define render_graph_execute(...) g_render_graph_api->execute(__VA_ARGS__)
+
+// Built-in render passes
+typedef struct BuiltinPasses {
+    // Forward rendering
+    PassHandle (*forward_pass)(RenderGraph* graph, ResourceHandle color_target, ResourceHandle depth_target);
+    
+    // Deferred rendering
+    PassHandle (*gbuffer_pass)(RenderGraph* graph, ResourceHandle* gbuffer_targets, uint32_t count, ResourceHandle depth);
+    PassHandle (*lighting_pass)(RenderGraph* graph, ResourceHandle* gbuffer_targets, uint32_t count, ResourceHandle output);
+    
+    // Shadow mapping
+    PassHandle (*shadow_pass)(RenderGraph* graph, ResourceHandle shadow_map, uint32_t cascade_index);
+    
+    // Post-processing
+    PassHandle (*bloom_pass)(RenderGraph* graph, ResourceHandle input, ResourceHandle output);
+    PassHandle (*tone_mapping_pass)(RenderGraph* graph, ResourceHandle input, ResourceHandle output);
+    PassHandle (*fxaa_pass)(RenderGraph* graph, ResourceHandle input, ResourceHandle output);
+    PassHandle (*taa_pass)(RenderGraph* graph, ResourceHandle input, ResourceHandle history, ResourceHandle output);
+    
+    // Screen-space effects
+    PassHandle (*ssao_pass)(RenderGraph* graph, ResourceHandle depth, ResourceHandle normal, ResourceHandle output);
+    PassHandle (*ssr_pass)(RenderGraph* graph, ResourceHandle color, ResourceHandle depth, ResourceHandle normal, ResourceHandle output);
+    
+    // Debug visualization
+    PassHandle (*debug_overlay_pass)(RenderGraph* graph, ResourceHandle target);
+} BuiltinPasses;
+
+extern BuiltinPasses* g_builtin_passes;
+
+#endif // RENDER_GRAPH_H

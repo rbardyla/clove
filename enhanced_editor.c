@@ -1,16 +1,16 @@
 /*
-    Enhanced Handmade Game Editor
-    A functional editor with real panels and features
+    Enhanced Editor with Integrated Renderer
+    =========================================
+    
+    A streamlined editor that demonstrates the integrated renderer system
+    with shader hot reload and performance statistics.
 */
 
-#include "systems/renderer/handmade_renderer.h"
-#include "systems/renderer/handmade_platform.h" 
-#include "systems/renderer/handmade_opengl.h"
+#include "handmade_platform.h"
 #include <stdio.h>
 #include <math.h>
-#include <stdbool.h>
 #include <string.h>
-#include <stdlib.h>
+#include <GL/gl.h>
 
 // ============================================================================
 // DATA STRUCTURES

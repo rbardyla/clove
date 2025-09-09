@@ -1,0 +1,1113 @@
+#include "renderer.h"
+#include "platform.h"
+#include "memory.h"
+#include <GL/glew.h>
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+
+#define MAX_SHADERS 1024
+#define MAX_TEXTURES 4096
+#define MAX_MESHES 2048
+#define MAX_MATERIALS 2048
+#define MAX_RENDER_TARGETS 256
+#define MAX_COMMANDS 65536
+#define MAX_SHADER_RELOAD_CALLBACKS 32
+#define MAX_UNIFORM_BUFFER_SIZE (1024 * 1024) // 1MB for uniform data
+
+// OpenGL shader
+typedef struct GLShader {
+    GLuint program;
+    GLuint vertex_shader;
+    GLuint fragment_shader;
+    GLuint geometry_shader;
+    GLuint compute_shader;
+    uint32_t generation;
+    char* vertex_path;
+    char* fragment_path;
+    uint64_t vertex_timestamp;
+    uint64_t fragment_timestamp;
+    bool needs_reload;
+    
+    // Uniform locations cache
+    struct {
+        GLint mvp_matrix;
+        GLint model_matrix;
+        GLint view_matrix;
+        GLint proj_matrix;
+        GLint normal_matrix;
+        GLint time;
+        GLint resolution;
+        GLint camera_position;
+    } uniforms;
+} GLShader;
+
+// OpenGL texture
+typedef struct GLTexture {
+    GLuint handle;
+    GLenum target;
+    GLenum format;
+    GLenum internal_format;
+    uint32_t width;
+    uint32_t height;
+    uint32_t depth;
+    uint32_t generation;
+    TextureFilter filter;
+    TextureWrap wrap_u;
+    TextureWrap wrap_v;
+    TextureWrap wrap_w;
+} GLTexture;
+
+// OpenGL mesh
+typedef struct GLMesh {
+    GLuint vao;
+    GLuint vbo;
+    GLuint ibo;
+    uint32_t vertex_count;
+    uint32_t index_count;
+    VertexFormat format;
+    PrimitiveType primitive;
+    uint32_t generation;
+} GLMesh;
+
+// OpenGL material
+typedef struct GLMaterial {
+    ShaderHandle shader;
+    RenderState render_state;
+    MaterialProperty* properties;
+    size_t property_count;
+    uint32_t generation;
+    uint8_t* uniform_buffer;
+    size_t uniform_buffer_size;
+} GLMaterial;
+
+// OpenGL render target
+typedef struct GLRenderTarget {
+    GLuint fbo;
+    GLuint color_textures[8];
+    GLuint depth_texture;
+    uint32_t width;
+    uint32_t height;
+    uint32_t color_attachment_count;
+    uint32_t generation;
+} GLRenderTarget;
+
+// Shader reload callback
+typedef struct ShaderReloadCallbackEntry {
+    ShaderReloadCallback callback;
+    void* user_data;
+} ShaderReloadCallbackEntry;
+
+// OpenGL renderer state
+struct Renderer {
+    // Memory
+    MemoryArena* arena;
+    MemoryArena* command_arena;
+    
+    // OpenGL context
+    void* window_handle;
+    uint32_t width;
+    uint32_t height;
+    
+    // Resources
+    GLShader shaders[MAX_SHADERS];
+    GLTexture textures[MAX_TEXTURES];
+    GLMesh meshes[MAX_MESHES];
+    GLMaterial materials[MAX_MATERIALS];
+    GLRenderTarget render_targets[MAX_RENDER_TARGETS];
+    
+    // Resource tracking
+    uint32_t shader_count;
+    uint32_t texture_count;
+    uint32_t mesh_count;
+    uint32_t material_count;
+    uint32_t render_target_count;
+    
+    // Command buffer
+    RenderCommand* commands;
+    uint32_t command_count;
+    uint32_t command_capacity;
+    
+    // Current state
+    ShaderHandle current_shader;
+    RenderTargetHandle current_render_target;
+    RenderState current_render_state;
+    Viewport current_viewport;
+    
+    // Hot reload
+    ShaderReloadCallbackEntry reload_callbacks[MAX_SHADER_RELOAD_CALLBACKS];
+    uint32_t reload_callback_count;
+    PlatformFileWatcher* shader_watcher;
+    
+    // Statistics
+    RenderStats stats;
+    
+    // Uniform buffer for material properties
+    uint8_t* uniform_staging_buffer;
+    
+    // Debug
+    bool debug_enabled;
+    uint32_t debug_group_depth;
+};
+
+// Convert enums to OpenGL
+static GLenum get_gl_primitive(PrimitiveType type) {
+    switch (type) {
+        case PRIMITIVE_TRIANGLES: return GL_TRIANGLES;
+        case PRIMITIVE_LINES: return GL_LINES;
+        case PRIMITIVE_POINTS: return GL_POINTS;
+        case PRIMITIVE_TRIANGLE_STRIP: return GL_TRIANGLE_STRIP;
+        default: return GL_TRIANGLES;
+    }
+}
+
+static GLenum get_gl_texture_format(TextureFormat format) {
+    switch (format) {
+        case TEXTURE_FORMAT_R8: return GL_RED;
+        case TEXTURE_FORMAT_RG8: return GL_RG;
+        case TEXTURE_FORMAT_RGB8: return GL_RGB;
+        case TEXTURE_FORMAT_RGBA8: return GL_RGBA;
+        case TEXTURE_FORMAT_R16F: return GL_RED;
+        case TEXTURE_FORMAT_RG16F: return GL_RG;
+        case TEXTURE_FORMAT_RGB16F: return GL_RGB;
+        case TEXTURE_FORMAT_RGBA16F: return GL_RGBA;
+        case TEXTURE_FORMAT_R32F: return GL_RED;
+        case TEXTURE_FORMAT_RG32F: return GL_RG;
+        case TEXTURE_FORMAT_RGB32F: return GL_RGB;
+        case TEXTURE_FORMAT_RGBA32F: return GL_RGBA;
+        case TEXTURE_FORMAT_DEPTH24_STENCIL8: return GL_DEPTH_STENCIL;
+        case TEXTURE_FORMAT_DEPTH32F: return GL_DEPTH_COMPONENT;
+        default: return GL_RGBA;
+    }
+}
+
+static GLenum get_gl_internal_format(TextureFormat format) {
+    switch (format) {
+        case TEXTURE_FORMAT_R8: return GL_R8;
+        case TEXTURE_FORMAT_RG8: return GL_RG8;
+        case TEXTURE_FORMAT_RGB8: return GL_RGB8;
+        case TEXTURE_FORMAT_RGBA8: return GL_RGBA8;
+        case TEXTURE_FORMAT_R16F: return GL_R16F;
+        case TEXTURE_FORMAT_RG16F: return GL_RG16F;
+        case TEXTURE_FORMAT_RGB16F: return GL_RGB16F;
+        case TEXTURE_FORMAT_RGBA16F: return GL_RGBA16F;
+        case TEXTURE_FORMAT_R32F: return GL_R32F;
+        case TEXTURE_FORMAT_RG32F: return GL_RG32F;
+        case TEXTURE_FORMAT_RGB32F: return GL_RGB32F;
+        case TEXTURE_FORMAT_RGBA32F: return GL_RGBA32F;
+        case TEXTURE_FORMAT_DEPTH24_STENCIL8: return GL_DEPTH24_STENCIL8;
+        case TEXTURE_FORMAT_DEPTH32F: return GL_DEPTH_COMPONENT32F;
+        default: return GL_RGBA8;
+    }
+}
+
+static GLenum get_gl_type(TextureFormat format) {
+    switch (format) {
+        case TEXTURE_FORMAT_R8:
+        case TEXTURE_FORMAT_RG8:
+        case TEXTURE_FORMAT_RGB8:
+        case TEXTURE_FORMAT_RGBA8:
+            return GL_UNSIGNED_BYTE;
+        case TEXTURE_FORMAT_R16F:
+        case TEXTURE_FORMAT_RG16F:
+        case TEXTURE_FORMAT_RGB16F:
+        case TEXTURE_FORMAT_RGBA16F:
+            return GL_HALF_FLOAT;
+        case TEXTURE_FORMAT_R32F:
+        case TEXTURE_FORMAT_RG32F:
+        case TEXTURE_FORMAT_RGB32F:
+        case TEXTURE_FORMAT_RGBA32F:
+            return GL_FLOAT;
+        case TEXTURE_FORMAT_DEPTH24_STENCIL8:
+            return GL_UNSIGNED_INT_24_8;
+        case TEXTURE_FORMAT_DEPTH32F:
+            return GL_FLOAT;
+        default:
+            return GL_UNSIGNED_BYTE;
+    }
+}
+
+// Shader compilation
+static GLuint compile_shader(GLenum type, const char* source) {
+    GLuint shader = glCreateShader(type);
+    glShaderSource(shader, 1, &source, NULL);
+    glCompileShader(shader);
+    
+    GLint success;
+    glGetShaderiv(shader, GL_COMPILE_STATUS, &success);
+    if (!success) {
+        char info_log[512];
+        glGetShaderInfoLog(shader, sizeof(info_log), NULL, info_log);
+        printf("Shader compilation failed: %s\n", info_log);
+        glDeleteShader(shader);
+        return 0;
+    }
+    
+    return shader;
+}
+
+static GLuint link_shader_program(GLuint vertex, GLuint fragment, GLuint geometry) {
+    GLuint program = glCreateProgram();
+    
+    if (vertex) glAttachShader(program, vertex);
+    if (fragment) glAttachShader(program, fragment);
+    if (geometry) glAttachShader(program, geometry);
+    
+    glLinkProgram(program);
+    
+    GLint success;
+    glGetProgramiv(program, GL_LINK_STATUS, &success);
+    if (!success) {
+        char info_log[512];
+        glGetProgramInfoLog(program, sizeof(info_log), NULL, info_log);
+        printf("Shader linking failed: %s\n", info_log);
+        glDeleteProgram(program);
+        return 0;
+    }
+    
+    return program;
+}
+
+static void cache_shader_uniforms(GLShader* shader) {
+    shader->uniforms.mvp_matrix = glGetUniformLocation(shader->program, "u_MVP");
+    shader->uniforms.model_matrix = glGetUniformLocation(shader->program, "u_Model");
+    shader->uniforms.view_matrix = glGetUniformLocation(shader->program, "u_View");
+    shader->uniforms.proj_matrix = glGetUniformLocation(shader->program, "u_Projection");
+    shader->uniforms.normal_matrix = glGetUniformLocation(shader->program, "u_NormalMatrix");
+    shader->uniforms.time = glGetUniformLocation(shader->program, "u_Time");
+    shader->uniforms.resolution = glGetUniformLocation(shader->program, "u_Resolution");
+    shader->uniforms.camera_position = glGetUniformLocation(shader->program, "u_CameraPos");
+}
+
+// File watching callback for shader hot reload
+static void shader_file_changed(const char* path, void* user_data) {
+    Renderer* renderer = (Renderer*)user_data;
+    
+    // Find which shader uses this file
+    for (uint32_t i = 0; i < renderer->shader_count; i++) {
+        GLShader* shader = &renderer->shaders[i];
+        if ((shader->vertex_path && strcmp(shader->vertex_path, path) == 0) ||
+            (shader->fragment_path && strcmp(shader->fragment_path, path) == 0)) {
+            shader->needs_reload = true;
+            printf("Shader file changed: %s (will reload on next frame)\n", path);
+        }
+    }
+}
+
+// Apply render state
+static void apply_render_state(Renderer* renderer, const RenderState* state) {
+    // Blend mode
+    switch (state->blend_mode) {
+        case BLEND_MODE_OPAQUE:
+            glDisable(GL_BLEND);
+            break;
+        case BLEND_MODE_ALPHA:
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            break;
+        case BLEND_MODE_ADDITIVE:
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_ONE, GL_ONE);
+            break;
+        case BLEND_MODE_MULTIPLY:
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_DST_COLOR, GL_ZERO);
+            break;
+        case BLEND_MODE_PREMULTIPLIED:
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+            break;
+    }
+    
+    // Cull mode
+    switch (state->cull_mode) {
+        case CULL_MODE_NONE:
+            glDisable(GL_CULL_FACE);
+            break;
+        case CULL_MODE_BACK:
+            glEnable(GL_CULL_FACE);
+            glCullFace(GL_BACK);
+            break;
+        case CULL_MODE_FRONT:
+            glEnable(GL_CULL_FACE);
+            glCullFace(GL_FRONT);
+            break;
+    }
+    
+    // Depth test
+    if (state->depth_test == DEPTH_TEST_NONE) {
+        glDisable(GL_DEPTH_TEST);
+    } else {
+        glEnable(GL_DEPTH_TEST);
+        GLenum func = GL_LESS;
+        switch (state->depth_test) {
+            case DEPTH_TEST_LESS: func = GL_LESS; break;
+            case DEPTH_TEST_LESS_EQUAL: func = GL_LEQUAL; break;
+            case DEPTH_TEST_GREATER: func = GL_GREATER; break;
+            case DEPTH_TEST_GREATER_EQUAL: func = GL_GEQUAL; break;
+            case DEPTH_TEST_EQUAL: func = GL_EQUAL; break;
+            case DEPTH_TEST_NOT_EQUAL: func = GL_NOTEQUAL; break;
+            case DEPTH_TEST_ALWAYS: func = GL_ALWAYS; break;
+        }
+        glDepthFunc(func);
+    }
+    
+    glDepthMask(state->depth_write ? GL_TRUE : GL_FALSE);
+    
+    // Wireframe
+    glPolygonMode(GL_FRONT_AND_BACK, state->wireframe ? GL_LINE : GL_FILL);
+    
+    // Line width and point size
+    glLineWidth(state->line_width);
+    glPointSize(state->point_size);
+    
+    renderer->current_render_state = *state;
+}
+
+// Renderer implementation
+static Renderer* opengl_create(MemoryArena* arena, void* window_handle, uint32_t width, uint32_t height) {
+    Renderer* renderer = arena_push_struct(arena, Renderer);
+    memset(renderer, 0, sizeof(Renderer));
+    
+    renderer->arena = arena;
+    renderer->window_handle = window_handle;
+    renderer->width = width;
+    renderer->height = height;
+    
+    // Create command arena (256MB as specified)
+    renderer->command_arena = arena_create_child(arena, 256 * 1024 * 1024);
+    renderer->commands = arena_push_array(renderer->command_arena, RenderCommand, MAX_COMMANDS);
+    renderer->command_capacity = MAX_COMMANDS;
+    
+    // Allocate uniform staging buffer
+    renderer->uniform_staging_buffer = arena_push_array(arena, uint8_t, MAX_UNIFORM_BUFFER_SIZE);
+    
+    // Initialize OpenGL
+    if (glewInit() != GLEW_OK) {
+        printf("Failed to initialize GLEW\n");
+        return NULL;
+    }
+    
+    // Set default OpenGL state
+    glEnable(GL_DEPTH_TEST);
+    glEnable(GL_CULL_FACE);
+    glCullFace(GL_BACK);
+    glFrontFace(GL_CCW);
+    
+    // Enable debug output if available
+    if (GLEW_ARB_debug_output) {
+        glEnable(GL_DEBUG_OUTPUT);
+        glEnable(GL_DEBUG_OUTPUT_SYNCHRONOUS);
+    }
+    
+    // Create shader file watcher
+    renderer->shader_watcher = platform_create_file_watcher(shader_file_changed, renderer);
+    
+    printf("OpenGL Renderer initialized\n");
+    printf("  Version: %s\n", glGetString(GL_VERSION));
+    printf("  Vendor: %s\n", glGetString(GL_VENDOR));
+    printf("  Renderer: %s\n", glGetString(GL_RENDERER));
+    
+    return renderer;
+}
+
+static void opengl_destroy(Renderer* renderer) {
+    // Cleanup OpenGL resources
+    for (uint32_t i = 0; i < renderer->shader_count; i++) {
+        glDeleteProgram(renderer->shaders[i].program);
+    }
+    
+    for (uint32_t i = 0; i < renderer->texture_count; i++) {
+        glDeleteTextures(1, &renderer->textures[i].handle);
+    }
+    
+    for (uint32_t i = 0; i < renderer->mesh_count; i++) {
+        glDeleteVertexArrays(1, &renderer->meshes[i].vao);
+        glDeleteBuffers(1, &renderer->meshes[i].vbo);
+        if (renderer->meshes[i].ibo) {
+            glDeleteBuffers(1, &renderer->meshes[i].ibo);
+        }
+    }
+    
+    for (uint32_t i = 0; i < renderer->render_target_count; i++) {
+        glDeleteFramebuffers(1, &renderer->render_targets[i].fbo);
+    }
+    
+    platform_destroy_file_watcher(renderer->shader_watcher);
+}
+
+static void opengl_resize(Renderer* renderer, uint32_t width, uint32_t height) {
+    renderer->width = width;
+    renderer->height = height;
+    glViewport(0, 0, width, height);
+}
+
+static void opengl_begin_frame(Renderer* renderer) {
+    // Check for shader reloads
+    for (uint32_t i = 0; i < renderer->shader_count; i++) {
+        GLShader* shader = &renderer->shaders[i];
+        if (shader->needs_reload) {
+            // Read shader files
+            char* vertex_source = NULL;
+            char* fragment_source = NULL;
+            
+            if (shader->vertex_path) {
+                PlatformFile file = platform_open_file(shader->vertex_path, FILE_MODE_READ);
+                if (file.handle) {
+                    size_t size = platform_get_file_size(&file);
+                    vertex_source = (char*)malloc(size + 1);
+                    platform_read_file(&file, vertex_source, size);
+                    vertex_source[size] = '\0';
+                    platform_close_file(&file);
+                }
+            }
+            
+            if (shader->fragment_path) {
+                PlatformFile file = platform_open_file(shader->fragment_path, FILE_MODE_READ);
+                if (file.handle) {
+                    size_t size = platform_get_file_size(&file);
+                    fragment_source = (char*)malloc(size + 1);
+                    platform_read_file(&file, fragment_source, size);
+                    fragment_source[size] = '\0';
+                    platform_close_file(&file);
+                }
+            }
+            
+            if (vertex_source && fragment_source) {
+                // Compile new shaders
+                GLuint new_vertex = compile_shader(GL_VERTEX_SHADER, vertex_source);
+                GLuint new_fragment = compile_shader(GL_FRAGMENT_SHADER, fragment_source);
+                
+                if (new_vertex && new_fragment) {
+                    GLuint new_program = link_shader_program(new_vertex, new_fragment, 0);
+                    
+                    if (new_program) {
+                        // Delete old program
+                        glDeleteProgram(shader->program);
+                        if (shader->vertex_shader) glDeleteShader(shader->vertex_shader);
+                        if (shader->fragment_shader) glDeleteShader(shader->fragment_shader);
+                        
+                        // Update shader
+                        shader->program = new_program;
+                        shader->vertex_shader = new_vertex;
+                        shader->fragment_shader = new_fragment;
+                        shader->generation++;
+                        cache_shader_uniforms(shader);
+                        
+                        // Notify callbacks
+                        ShaderHandle handle = {i, shader->generation};
+                        for (uint32_t j = 0; j < renderer->reload_callback_count; j++) {
+                            renderer->reload_callbacks[j].callback(handle, renderer->reload_callbacks[j].user_data);
+                        }
+                        
+                        printf("Shader reloaded successfully\n");
+                    } else {
+                        glDeleteShader(new_vertex);
+                        glDeleteShader(new_fragment);
+                        printf("Failed to reload shader (linking failed)\n");
+                    }
+                } else {
+                    if (new_vertex) glDeleteShader(new_vertex);
+                    if (new_fragment) glDeleteShader(new_fragment);
+                    printf("Failed to reload shader (compilation failed)\n");
+                }
+            }
+            
+            free(vertex_source);
+            free(fragment_source);
+            shader->needs_reload = false;
+        }
+    }
+    
+    // Reset stats
+    renderer->stats.draw_calls = 0;
+    renderer->stats.triangles = 0;
+    renderer->stats.vertices = 0;
+    renderer->stats.state_changes = 0;
+    renderer->stats.texture_binds = 0;
+    renderer->stats.shader_binds = 0;
+    renderer->stats.render_target_changes = 0;
+}
+
+static void opengl_end_frame(Renderer* renderer) {
+    // Process remaining commands
+    if (renderer->command_count > 0) {
+        opengl_submit_commands(renderer);
+    }
+}
+
+static void opengl_present(Renderer* renderer, bool vsync) {
+    // Platform-specific swap buffers (implement in platform layer)
+    platform_swap_buffers(renderer->window_handle);
+}
+
+static RenderCommand* opengl_push_command(Renderer* renderer) {
+    if (renderer->command_count >= renderer->command_capacity) {
+        // Flush commands if buffer is full
+        opengl_submit_commands(renderer);
+    }
+    
+    return &renderer->commands[renderer->command_count++];
+}
+
+static void execute_render_command(Renderer* renderer, const RenderCommand* cmd) {
+    switch (cmd->type) {
+        case RENDER_CMD_CLEAR: {
+            const ClearCommand* clear = &cmd->data.clear;
+            GLbitfield mask = 0;
+            
+            if (clear->flags & CLEAR_COLOR) {
+                glClearColor(clear->color.x, clear->color.y, clear->color.z, clear->color.w);
+                mask |= GL_COLOR_BUFFER_BIT;
+            }
+            if (clear->flags & CLEAR_DEPTH) {
+                glClearDepth(clear->depth);
+                mask |= GL_DEPTH_BUFFER_BIT;
+            }
+            if (clear->flags & CLEAR_STENCIL) {
+                glClearStencil(clear->stencil);
+                mask |= GL_STENCIL_BUFFER_BIT;
+            }
+            
+            glClear(mask);
+            break;
+        }
+        
+        case RENDER_CMD_SET_VIEWPORT: {
+            const SetViewportCommand* viewport = &cmd->data.viewport;
+            glViewport(viewport->viewport.x, viewport->viewport.y,
+                      viewport->viewport.width, viewport->viewport.height);
+            glDepthRange(viewport->viewport.min_depth, viewport->viewport.max_depth);
+            renderer->current_viewport = viewport->viewport;
+            break;
+        }
+        
+        case RENDER_CMD_SET_RENDER_TARGET: {
+            const SetRenderTargetCommand* rt = &cmd->data.render_target;
+            if (rt->target.id == 0) {
+                glBindFramebuffer(GL_FRAMEBUFFER, 0);
+            } else {
+                GLRenderTarget* target = &renderer->render_targets[rt->target.id - 1];
+                glBindFramebuffer(GL_FRAMEBUFFER, target->fbo);
+            }
+            renderer->current_render_target = rt->target;
+            renderer->stats.render_target_changes++;
+            break;
+        }
+        
+        case RENDER_CMD_DRAW: {
+            const DrawCommand* draw = &cmd->data.draw;
+            
+            // Bind material
+            if (draw->material.id > 0 && draw->material.id <= renderer->material_count) {
+                GLMaterial* material = &renderer->materials[draw->material.id - 1];
+                
+                // Bind shader
+                if (material->shader.id > 0 && material->shader.id <= renderer->shader_count) {
+                    GLShader* shader = &renderer->shaders[material->shader.id - 1];
+                    glUseProgram(shader->program);
+                    
+                    // Set uniforms
+                    if (shader->uniforms.model_matrix >= 0) {
+                        glUniformMatrix4fv(shader->uniforms.model_matrix, 1, GL_FALSE, draw->transform.m);
+                    }
+                    
+                    // Set material properties
+                    for (size_t i = 0; i < material->property_count; i++) {
+                        MaterialProperty* prop = &material->properties[i];
+                        GLint location = glGetUniformLocation(shader->program, prop->name);
+                        
+                        if (location >= 0) {
+                            switch (prop->type) {
+                                case UNIFORM_TYPE_FLOAT:
+                                    glUniform1f(location, prop->value.f);
+                                    break;
+                                case UNIFORM_TYPE_VEC2:
+                                    glUniform2fv(location, 1, (float*)&prop->value.v2);
+                                    break;
+                                case UNIFORM_TYPE_VEC3:
+                                    glUniform3fv(location, 1, (float*)&prop->value.v3);
+                                    break;
+                                case UNIFORM_TYPE_VEC4:
+                                    glUniform4fv(location, 1, (float*)&prop->value.v4);
+                                    break;
+                                case UNIFORM_TYPE_MAT4:
+                                    glUniformMatrix4fv(location, 1, GL_FALSE, prop->value.m4.m);
+                                    break;
+                                case UNIFORM_TYPE_TEXTURE2D:
+                                    // Bind texture
+                                    if (prop->value.texture.id > 0 && prop->value.texture.id <= renderer->texture_count) {
+                                        GLTexture* texture = &renderer->textures[prop->value.texture.id - 1];
+                                        glActiveTexture(GL_TEXTURE0 + i);
+                                        glBindTexture(texture->target, texture->handle);
+                                        glUniform1i(location, i);
+                                        renderer->stats.texture_binds++;
+                                    }
+                                    break;
+                            }
+                        }
+                    }
+                    
+                    renderer->stats.shader_binds++;
+                }
+                
+                // Apply render state
+                apply_render_state(renderer, &material->render_state);
+            }
+            
+            // Bind mesh and draw
+            if (draw->mesh.id > 0 && draw->mesh.id <= renderer->mesh_count) {
+                GLMesh* mesh = &renderer->meshes[draw->mesh.id - 1];
+                glBindVertexArray(mesh->vao);
+                
+                GLenum primitive = get_gl_primitive(mesh->primitive);
+                glDrawArrays(primitive, draw->first_vertex, draw->vertex_count ? draw->vertex_count : mesh->vertex_count);
+                
+                renderer->stats.draw_calls++;
+                renderer->stats.vertices += mesh->vertex_count;
+                if (mesh->primitive == PRIMITIVE_TRIANGLES) {
+                    renderer->stats.triangles += mesh->vertex_count / 3;
+                }
+            }
+            break;
+        }
+        
+        case RENDER_CMD_DRAW_INDEXED: {
+            const DrawIndexedCommand* draw = &cmd->data.draw_indexed;
+            
+            // Similar to RENDER_CMD_DRAW but use glDrawElements
+            // ... (implementation similar to above)
+            break;
+        }
+        
+        case RENDER_CMD_DRAW_INSTANCED: {
+            const DrawInstancedCommand* draw = &cmd->data.draw_instanced;
+            // ... implement instanced drawing
+            break;
+        }
+        
+        case RENDER_CMD_BEGIN_DEBUG_MARKER: {
+            if (renderer->debug_enabled && GLEW_EXT_debug_marker) {
+                const DebugMarkerCommand* marker = &cmd->data.debug_marker;
+                glPushDebugGroup(GL_DEBUG_SOURCE_APPLICATION, 0, -1, marker->name);
+                renderer->debug_group_depth++;
+            }
+            break;
+        }
+        
+        case RENDER_CMD_END_DEBUG_MARKER: {
+            if (renderer->debug_enabled && renderer->debug_group_depth > 0 && GLEW_EXT_debug_marker) {
+                glPopDebugGroup();
+                renderer->debug_group_depth--;
+            }
+            break;
+        }
+    }
+}
+
+static void opengl_submit_commands(Renderer* renderer) {
+    for (uint32_t i = 0; i < renderer->command_count; i++) {
+        execute_render_command(renderer, &renderer->commands[i]);
+    }
+    renderer->command_count = 0;
+}
+
+static void opengl_flush_commands(Renderer* renderer) {
+    opengl_submit_commands(renderer);
+    glFlush();
+}
+
+static void opengl_clear_commands(Renderer* renderer) {
+    renderer->command_count = 0;
+}
+
+static ShaderHandle opengl_create_shader(Renderer* renderer, const ShaderSource* source) {
+    if (renderer->shader_count >= MAX_SHADERS) {
+        return INVALID_SHADER_HANDLE;
+    }
+    
+    GLuint vertex = 0, fragment = 0, geometry = 0;
+    
+    if (source->vertex_source) {
+        vertex = compile_shader(GL_VERTEX_SHADER, source->vertex_source);
+        if (!vertex) return INVALID_SHADER_HANDLE;
+    }
+    
+    if (source->fragment_source) {
+        fragment = compile_shader(GL_FRAGMENT_SHADER, source->fragment_source);
+        if (!fragment) {
+            if (vertex) glDeleteShader(vertex);
+            return INVALID_SHADER_HANDLE;
+        }
+    }
+    
+    if (source->geometry_source) {
+        geometry = compile_shader(GL_GEOMETRY_SHADER, source->geometry_source);
+    }
+    
+    GLuint program = link_shader_program(vertex, fragment, geometry);
+    if (!program) {
+        if (vertex) glDeleteShader(vertex);
+        if (fragment) glDeleteShader(fragment);
+        if (geometry) glDeleteShader(geometry);
+        return INVALID_SHADER_HANDLE;
+    }
+    
+    uint32_t index = renderer->shader_count++;
+    GLShader* shader = &renderer->shaders[index];
+    shader->program = program;
+    shader->vertex_shader = vertex;
+    shader->fragment_shader = fragment;
+    shader->geometry_shader = geometry;
+    shader->generation = 1;
+    
+    // Cache uniform locations
+    cache_shader_uniforms(shader);
+    
+    // Store paths for hot reload if provided
+    if (source->include_path) {
+        size_t path_len = strlen(source->include_path);
+        shader->vertex_path = arena_push_array(renderer->arena, char, path_len + 32);
+        shader->fragment_path = arena_push_array(renderer->arena, char, path_len + 32);
+        sprintf(shader->vertex_path, "%s/vertex.glsl", source->include_path);
+        sprintf(shader->fragment_path, "%s/fragment.glsl", source->include_path);
+        
+        // Watch files
+        platform_watch_file(renderer->shader_watcher, shader->vertex_path);
+        platform_watch_file(renderer->shader_watcher, shader->fragment_path);
+    }
+    
+    return (ShaderHandle){index + 1, shader->generation};
+}
+
+static TextureHandle opengl_create_texture(Renderer* renderer, const TextureDesc* desc) {
+    if (renderer->texture_count >= MAX_TEXTURES) {
+        return INVALID_TEXTURE_HANDLE;
+    }
+    
+    GLuint handle;
+    glGenTextures(1, &handle);
+    
+    GLenum target = desc->depth > 1 ? GL_TEXTURE_3D : (desc->height > 1 ? GL_TEXTURE_2D : GL_TEXTURE_1D);
+    glBindTexture(target, handle);
+    
+    // Set texture parameters
+    GLenum min_filter = GL_LINEAR;
+    GLenum mag_filter = GL_LINEAR;
+    
+    switch (desc->filter) {
+        case TEXTURE_FILTER_NEAREST:
+            min_filter = mag_filter = GL_NEAREST;
+            break;
+        case TEXTURE_FILTER_LINEAR:
+            min_filter = mag_filter = GL_LINEAR;
+            break;
+        case TEXTURE_FILTER_TRILINEAR:
+            min_filter = GL_LINEAR_MIPMAP_LINEAR;
+            mag_filter = GL_LINEAR;
+            break;
+        case TEXTURE_FILTER_ANISOTROPIC_2X:
+        case TEXTURE_FILTER_ANISOTROPIC_4X:
+        case TEXTURE_FILTER_ANISOTROPIC_8X:
+        case TEXTURE_FILTER_ANISOTROPIC_16X:
+            min_filter = GL_LINEAR_MIPMAP_LINEAR;
+            mag_filter = GL_LINEAR;
+            if (GLEW_EXT_texture_filter_anisotropic) {
+                float aniso = 2.0f;
+                if (desc->filter == TEXTURE_FILTER_ANISOTROPIC_4X) aniso = 4.0f;
+                else if (desc->filter == TEXTURE_FILTER_ANISOTROPIC_8X) aniso = 8.0f;
+                else if (desc->filter == TEXTURE_FILTER_ANISOTROPIC_16X) aniso = 16.0f;
+                glTexParameterf(target, GL_TEXTURE_MAX_ANISOTROPY_EXT, aniso);
+            }
+            break;
+    }
+    
+    glTexParameteri(target, GL_TEXTURE_MIN_FILTER, min_filter);
+    glTexParameteri(target, GL_TEXTURE_MAG_FILTER, mag_filter);
+    
+    // Wrap modes
+    GLenum wrap_s = GL_REPEAT;
+    switch (desc->wrap_u) {
+        case TEXTURE_WRAP_CLAMP: wrap_s = GL_CLAMP_TO_EDGE; break;
+        case TEXTURE_WRAP_MIRROR: wrap_s = GL_MIRRORED_REPEAT; break;
+        case TEXTURE_WRAP_BORDER: wrap_s = GL_CLAMP_TO_BORDER; break;
+    }
+    glTexParameteri(target, GL_TEXTURE_WRAP_S, wrap_s);
+    
+    if (target != GL_TEXTURE_1D) {
+        GLenum wrap_t = GL_REPEAT;
+        switch (desc->wrap_v) {
+            case TEXTURE_WRAP_CLAMP: wrap_t = GL_CLAMP_TO_EDGE; break;
+            case TEXTURE_WRAP_MIRROR: wrap_t = GL_MIRRORED_REPEAT; break;
+            case TEXTURE_WRAP_BORDER: wrap_t = GL_CLAMP_TO_BORDER; break;
+        }
+        glTexParameteri(target, GL_TEXTURE_WRAP_T, wrap_t);
+    }
+    
+    if (target == GL_TEXTURE_3D) {
+        GLenum wrap_r = GL_REPEAT;
+        switch (desc->wrap_w) {
+            case TEXTURE_WRAP_CLAMP: wrap_r = GL_CLAMP_TO_EDGE; break;
+            case TEXTURE_WRAP_MIRROR: wrap_r = GL_MIRRORED_REPEAT; break;
+            case TEXTURE_WRAP_BORDER: wrap_r = GL_CLAMP_TO_BORDER; break;
+        }
+        glTexParameteri(target, GL_TEXTURE_WRAP_R, wrap_r);
+    }
+    
+    // Upload texture data
+    GLenum format = get_gl_texture_format(desc->format);
+    GLenum internal_format = get_gl_internal_format(desc->format);
+    GLenum type = get_gl_type(desc->format);
+    
+    if (target == GL_TEXTURE_2D) {
+        glTexImage2D(target, 0, internal_format, desc->width, desc->height, 0, format, type, desc->data);
+    } else if (target == GL_TEXTURE_3D) {
+        glTexImage3D(target, 0, internal_format, desc->width, desc->height, desc->depth, 0, format, type, desc->data);
+    } else {
+        glTexImage1D(target, 0, internal_format, desc->width, 0, format, type, desc->data);
+    }
+    
+    // Generate mipmaps if requested
+    if (desc->generate_mipmaps) {
+        glGenerateMipmap(target);
+    }
+    
+    uint32_t index = renderer->texture_count++;
+    GLTexture* texture = &renderer->textures[index];
+    texture->handle = handle;
+    texture->target = target;
+    texture->format = format;
+    texture->internal_format = internal_format;
+    texture->width = desc->width;
+    texture->height = desc->height;
+    texture->depth = desc->depth;
+    texture->generation = 1;
+    texture->filter = desc->filter;
+    texture->wrap_u = desc->wrap_u;
+    texture->wrap_v = desc->wrap_v;
+    texture->wrap_w = desc->wrap_w;
+    
+    return (TextureHandle){index + 1, texture->generation};
+}
+
+static MeshHandle opengl_create_mesh(Renderer* renderer, const MeshData* data) {
+    if (renderer->mesh_count >= MAX_MESHES) {
+        return INVALID_MESH_HANDLE;
+    }
+    
+    GLuint vao, vbo, ibo = 0;
+    glGenVertexArrays(1, &vao);
+    glGenBuffers(1, &vbo);
+    
+    glBindVertexArray(vao);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    glBufferData(GL_ARRAY_BUFFER, data->vertex_size * data->vertex_count, data->vertices, GL_STATIC_DRAW);
+    
+    // Setup vertex attributes based on format
+    switch (data->format) {
+        case VERTEX_FORMAT_P3F:
+            glEnableVertexAttribArray(0);
+            glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(Vertex_P3F), (void*)0);
+            break;
+            
+        case VERTEX_FORMAT_P3F_N3F:
+            glEnableVertexAttribArray(0);
+            glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(Vertex_P3F_N3F), (void*)0);
+            glEnableVertexAttribArray(1);
+            glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, sizeof(Vertex_P3F_N3F), (void*)offsetof(Vertex_P3F_N3F, normal));
+            break;
+            
+        case VERTEX_FORMAT_P3F_N3F_T2F:
+            glEnableVertexAttribArray(0);
+            glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(Vertex_P3F_N3F_T2F), (void*)0);
+            glEnableVertexAttribArray(1);
+            glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, sizeof(Vertex_P3F_N3F_T2F), (void*)offsetof(Vertex_P3F_N3F_T2F, normal));
+            glEnableVertexAttribArray(2);
+            glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, sizeof(Vertex_P3F_N3F_T2F), (void*)offsetof(Vertex_P3F_N3F_T2F, texcoord));
+            break;
+            
+        case VERTEX_FORMAT_P3F_N3F_T2F_T3F_B3F:
+            glEnableVertexAttribArray(0);
+            glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(Vertex_P3F_N3F_T2F_T3F_B3F), (void*)0);
+            glEnableVertexAttribArray(1);
+            glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, sizeof(Vertex_P3F_N3F_T2F_T3F_B3F), (void*)offsetof(Vertex_P3F_N3F_T2F_T3F_B3F, normal));
+            glEnableVertexAttribArray(2);
+            glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, sizeof(Vertex_P3F_N3F_T2F_T3F_B3F), (void*)offsetof(Vertex_P3F_N3F_T2F_T3F_B3F, texcoord));
+            glEnableVertexAttribArray(3);
+            glVertexAttribPointer(3, 3, GL_FLOAT, GL_FALSE, sizeof(Vertex_P3F_N3F_T2F_T3F_B3F), (void*)offsetof(Vertex_P3F_N3F_T2F_T3F_B3F, tangent));
+            glEnableVertexAttribArray(4);
+            glVertexAttribPointer(4, 3, GL_FLOAT, GL_FALSE, sizeof(Vertex_P3F_N3F_T2F_T3F_B3F), (void*)offsetof(Vertex_P3F_N3F_T2F_T3F_B3F, bitangent));
+            break;
+            
+        case VERTEX_FORMAT_P3F_N3F_T2F_C4U8:
+            glEnableVertexAttribArray(0);
+            glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(Vertex_P3F_N3F_T2F_C4U8), (void*)0);
+            glEnableVertexAttribArray(1);
+            glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, sizeof(Vertex_P3F_N3F_T2F_C4U8), (void*)offsetof(Vertex_P3F_N3F_T2F_C4U8, normal));
+            glEnableVertexAttribArray(2);
+            glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, sizeof(Vertex_P3F_N3F_T2F_C4U8), (void*)offsetof(Vertex_P3F_N3F_T2F_C4U8, texcoord));
+            glEnableVertexAttribArray(3);
+            glVertexAttribPointer(3, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(Vertex_P3F_N3F_T2F_C4U8), (void*)offsetof(Vertex_P3F_N3F_T2F_C4U8, color));
+            break;
+    }
+    
+    // Create index buffer if provided
+    if (data->indices && data->index_count > 0) {
+        glGenBuffers(1, &ibo);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ibo);
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(uint32_t) * data->index_count, data->indices, GL_STATIC_DRAW);
+    }
+    
+    glBindVertexArray(0);
+    
+    uint32_t index = renderer->mesh_count++;
+    GLMesh* mesh = &renderer->meshes[index];
+    mesh->vao = vao;
+    mesh->vbo = vbo;
+    mesh->ibo = ibo;
+    mesh->vertex_count = data->vertex_count;
+    mesh->index_count = data->index_count;
+    mesh->format = data->format;
+    mesh->primitive = data->primitive;
+    mesh->generation = 1;
+    
+    return (MeshHandle){index + 1, mesh->generation};
+}
+
+static MaterialHandle opengl_create_material(Renderer* renderer, const MaterialDesc* desc) {
+    if (renderer->material_count >= MAX_MATERIALS) {
+        return INVALID_MATERIAL_HANDLE;
+    }
+    
+    uint32_t index = renderer->material_count++;
+    GLMaterial* material = &renderer->materials[index];
+    
+    material->shader = desc->shader;
+    material->render_state = desc->render_state;
+    material->generation = 1;
+    
+    // Copy properties
+    if (desc->property_count > 0) {
+        material->properties = arena_push_array(renderer->arena, MaterialProperty, desc->property_count);
+        material->property_count = desc->property_count;
+        
+        for (size_t i = 0; i < desc->property_count; i++) {
+            material->properties[i] = desc->properties[i];
+            // Duplicate name string
+            size_t name_len = strlen(desc->properties[i].name) + 1;
+            char* name_copy = arena_push_array(renderer->arena, char, name_len);
+            memcpy(name_copy, desc->properties[i].name, name_len);
+            material->properties[i].name = name_copy;
+        }
+    }
+    
+    return (MaterialHandle){index + 1, material->generation};
+}
+
+static void opengl_reload_shader(Renderer* renderer, ShaderHandle handle, const ShaderSource* source) {
+    if (handle.id == 0 || handle.id > renderer->shader_count) return;
+    
+    GLShader* shader = &renderer->shaders[handle.id - 1];
+    
+    // Compile new shaders
+    GLuint vertex = 0, fragment = 0, geometry = 0;
+    
+    if (source->vertex_source) {
+        vertex = compile_shader(GL_VERTEX_SHADER, source->vertex_source);
+        if (!vertex) return;
+    }
+    
+    if (source->fragment_source) {
+        fragment = compile_shader(GL_FRAGMENT_SHADER, source->fragment_source);
+        if (!fragment) {
+            if (vertex) glDeleteShader(vertex);
+            return;
+        }
+    }
+    
+    if (source->geometry_source) {
+        geometry = compile_shader(GL_GEOMETRY_SHADER, source->geometry_source);
+    }
+    
+    GLuint program = link_shader_program(vertex, fragment, geometry);
+    if (!program) {
+        if (vertex) glDeleteShader(vertex);
+        if (fragment) glDeleteShader(fragment);
+        if (geometry) glDeleteShader(geometry);
+        return;
+    }
+    
+    // Delete old program
+    glDeleteProgram(shader->program);
+    if (shader->vertex_shader) glDeleteShader(shader->vertex_shader);
+    if (shader->fragment_shader) glDeleteShader(shader->fragment_shader);
+    if (shader->geometry_shader) glDeleteShader(shader->geometry_shader);
+    
+    // Update shader
+    shader->program = program;
+    shader->vertex_shader = vertex;
+    shader->fragment_shader = fragment;
+    shader->geometry_shader = geometry;
+    shader->generation++;
+    cache_shader_uniforms(shader);
+    
+    // Notify callbacks
+    ShaderHandle new_handle = {handle.id, shader->generation};
+    for (uint32_t i = 0; i < renderer->reload_callback_count; i++) {
+        renderer->reload_callbacks[i].callback(new_handle, renderer->reload_callbacks[i].user_data);
+    }
+    
+    printf("Shader manually reloaded\n");
+}
+
+static void opengl_register_shader_reload_callback(Renderer* renderer, ShaderReloadCallback callback, void* user_data) {
+    if (renderer->reload_callback_count < MAX_SHADER_RELOAD_CALLBACKS) {
+        renderer->reload_callbacks[renderer->reload_callback_count].callback = callback;
+        renderer->reload_callbacks[renderer->reload_callback_count].user_data = user_data;
+        renderer->reload_callback_count++;
+    }
+}
+
+static void opengl_draw_mesh(Renderer* renderer, MeshHandle mesh, MaterialHandle material, const Mat4* transform) {
+    RenderCommand* cmd = opengl_push_command(renderer);
+    cmd->type = RENDER_CMD_DRAW;
+    cmd->data.draw.mesh = mesh;
+    cmd->data.draw.material = material;
+    cmd->data.draw.transform = *transform;
+    cmd->data.draw.vertex_count = 0;  // Use full mesh
+    cmd->data.draw.first_vertex = 0;
+}
+
+static RenderStats opengl_get_stats(Renderer* renderer) {
+    return renderer->stats;
+}
+
+// Create the global API structure
+static RendererAPI opengl_renderer_api = {
+    .create = opengl_create,
+    .destroy = opengl_destroy,
+    .resize = opengl_resize,
+    .begin_frame = opengl_begin_frame,
+    .end_frame = opengl_end_frame,
+    .present = opengl_present,
+    .push_command = opengl_push_command,
+    .submit_commands = opengl_submit_commands,
+    .flush_commands = opengl_flush_commands,
+    .clear_commands = opengl_clear_commands,
+    .create_shader = opengl_create_shader,
+    .create_texture = opengl_create_texture,
+    .create_mesh = opengl_create_mesh,
+    .create_material = opengl_create_material,
+    .reload_shader = opengl_reload_shader,
+    .register_shader_reload_callback = opengl_register_shader_reload_callback,
+    .draw_mesh = opengl_draw_mesh,
+    .get_stats = opengl_get_stats,
+};
+
+// Export the API
+RendererAPI* g_renderer_api = &opengl_renderer_api;
+
+// Initialization function
+void renderer_init_opengl(void) {
+    g_renderer_api = &opengl_renderer_api;
+}

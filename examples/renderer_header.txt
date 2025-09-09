@@ -1,0 +1,493 @@
+#ifndef RENDERER_H
+#define RENDERER_H
+
+#include <stdint.h>
+#include <stddef.h>
+#include "platform.h"
+#include "memory.h"
+
+// Forward declarations
+typedef struct Renderer Renderer;
+typedef struct RenderCommand RenderCommand;
+typedef struct Material Material;
+typedef struct Shader Shader;
+typedef struct Texture Texture;
+typedef struct Mesh Mesh;
+typedef struct RenderTarget RenderTarget;
+
+// Handles for GPU resources (stable across hot reload)
+typedef struct { uint32_t id; uint32_t generation; } ShaderHandle;
+typedef struct { uint32_t id; uint32_t generation; } TextureHandle;
+typedef struct { uint32_t id; uint32_t generation; } MeshHandle;
+typedef struct { uint32_t id; uint32_t generation; } MaterialHandle;
+typedef struct { uint32_t id; uint32_t generation; } RenderTargetHandle;
+
+#define INVALID_SHADER_HANDLE ((ShaderHandle){0, 0})
+#define INVALID_TEXTURE_HANDLE ((TextureHandle){0, 0})
+#define INVALID_MESH_HANDLE ((MeshHandle){0, 0})
+#define INVALID_MATERIAL_HANDLE ((MaterialHandle){0, 0})
+#define INVALID_RENDER_TARGET_HANDLE ((RenderTargetHandle){0, 0})
+
+// Vertex formats
+typedef enum VertexFormat {
+    VERTEX_FORMAT_P3F,           // Position only (3 floats)
+    VERTEX_FORMAT_P3F_N3F,       // Position + Normal
+    VERTEX_FORMAT_P3F_N3F_T2F,   // Position + Normal + TexCoord
+    VERTEX_FORMAT_P3F_N3F_T2F_T3F_B3F, // + Tangent + Bitangent
+    VERTEX_FORMAT_P3F_N3F_T2F_C4U8,    // + Color
+    VERTEX_FORMAT_COUNT
+} VertexFormat;
+
+// Primitive types
+typedef enum PrimitiveType {
+    PRIMITIVE_TRIANGLES,
+    PRIMITIVE_LINES,
+    PRIMITIVE_POINTS,
+    PRIMITIVE_TRIANGLE_STRIP,
+    PRIMITIVE_COUNT
+} PrimitiveType;
+
+// Texture formats
+typedef enum TextureFormat {
+    TEXTURE_FORMAT_R8,
+    TEXTURE_FORMAT_RG8,
+    TEXTURE_FORMAT_RGB8,
+    TEXTURE_FORMAT_RGBA8,
+    TEXTURE_FORMAT_R16F,
+    TEXTURE_FORMAT_RG16F,
+    TEXTURE_FORMAT_RGB16F,
+    TEXTURE_FORMAT_RGBA16F,
+    TEXTURE_FORMAT_R32F,
+    TEXTURE_FORMAT_RG32F,
+    TEXTURE_FORMAT_RGB32F,
+    TEXTURE_FORMAT_RGBA32F,
+    TEXTURE_FORMAT_DEPTH24_STENCIL8,
+    TEXTURE_FORMAT_DEPTH32F,
+    TEXTURE_FORMAT_COUNT
+} TextureFormat;
+
+// Texture filtering
+typedef enum TextureFilter {
+    TEXTURE_FILTER_NEAREST,
+    TEXTURE_FILTER_LINEAR,
+    TEXTURE_FILTER_TRILINEAR,
+    TEXTURE_FILTER_ANISOTROPIC_2X,
+    TEXTURE_FILTER_ANISOTROPIC_4X,
+    TEXTURE_FILTER_ANISOTROPIC_8X,
+    TEXTURE_FILTER_ANISOTROPIC_16X,
+} TextureFilter;
+
+// Texture wrap modes
+typedef enum TextureWrap {
+    TEXTURE_WRAP_REPEAT,
+    TEXTURE_WRAP_CLAMP,
+    TEXTURE_WRAP_MIRROR,
+    TEXTURE_WRAP_BORDER,
+} TextureWrap;
+
+// Blend modes
+typedef enum BlendMode {
+    BLEND_MODE_OPAQUE,
+    BLEND_MODE_ALPHA,
+    BLEND_MODE_ADDITIVE,
+    BLEND_MODE_MULTIPLY,
+    BLEND_MODE_PREMULTIPLIED,
+    BLEND_MODE_COUNT
+} BlendMode;
+
+// Cull modes
+typedef enum CullMode {
+    CULL_MODE_NONE,
+    CULL_MODE_BACK,
+    CULL_MODE_FRONT,
+    CULL_MODE_COUNT
+} CullMode;
+
+// Depth test modes
+typedef enum DepthTest {
+    DEPTH_TEST_NONE,
+    DEPTH_TEST_LESS,
+    DEPTH_TEST_LESS_EQUAL,
+    DEPTH_TEST_GREATER,
+    DEPTH_TEST_GREATER_EQUAL,
+    DEPTH_TEST_EQUAL,
+    DEPTH_TEST_NOT_EQUAL,
+    DEPTH_TEST_ALWAYS,
+    DEPTH_TEST_COUNT
+} DepthTest;
+
+// Shader stages
+typedef enum ShaderStage {
+    SHADER_STAGE_VERTEX   = 0x01,
+    SHADER_STAGE_FRAGMENT = 0x02,
+    SHADER_STAGE_GEOMETRY = 0x04,
+    SHADER_STAGE_COMPUTE  = 0x08,
+} ShaderStage;
+
+// Uniform types
+typedef enum UniformType {
+    UNIFORM_TYPE_FLOAT,
+    UNIFORM_TYPE_VEC2,
+    UNIFORM_TYPE_VEC3,
+    UNIFORM_TYPE_VEC4,
+    UNIFORM_TYPE_INT,
+    UNIFORM_TYPE_IVEC2,
+    UNIFORM_TYPE_IVEC3,
+    UNIFORM_TYPE_IVEC4,
+    UNIFORM_TYPE_MAT3,
+    UNIFORM_TYPE_MAT4,
+    UNIFORM_TYPE_TEXTURE2D,
+    UNIFORM_TYPE_TEXTURE3D,
+    UNIFORM_TYPE_TEXTURECUBE,
+    UNIFORM_TYPE_COUNT
+} UniformType;
+
+// Math types (align with your math library)
+typedef struct Vec2 { float x, y; } Vec2;
+typedef struct Vec3 { float x, y, z; } Vec3;
+typedef struct Vec4 { float x, y, z, w; } Vec4;
+typedef struct Mat3 { float m[9]; } Mat3;
+typedef struct Mat4 { float m[16]; } Mat4;
+typedef struct Color { uint8_t r, g, b, a; } Color;
+
+// Vertex data
+typedef struct Vertex_P3F {
+    Vec3 position;
+} Vertex_P3F;
+
+typedef struct Vertex_P3F_N3F {
+    Vec3 position;
+    Vec3 normal;
+} Vertex_P3F_N3F;
+
+typedef struct Vertex_P3F_N3F_T2F {
+    Vec3 position;
+    Vec3 normal;
+    Vec2 texcoord;
+} Vertex_P3F_N3F_T2F;
+
+typedef struct Vertex_P3F_N3F_T2F_T3F_B3F {
+    Vec3 position;
+    Vec3 normal;
+    Vec2 texcoord;
+    Vec3 tangent;
+    Vec3 bitangent;
+} Vertex_P3F_N3F_T2F_T3F_B3F;
+
+typedef struct Vertex_P3F_N3F_T2F_C4U8 {
+    Vec3 position;
+    Vec3 normal;
+    Vec2 texcoord;
+    Color color;
+} Vertex_P3F_N3F_T2F_C4U8;
+
+// Render state
+typedef struct RenderState {
+    BlendMode blend_mode;
+    CullMode cull_mode;
+    DepthTest depth_test;
+    bool depth_write;
+    bool wireframe;
+    float line_width;
+    float point_size;
+} RenderState;
+
+// Viewport
+typedef struct Viewport {
+    int32_t x, y;
+    int32_t width, height;
+    float min_depth, max_depth;
+} Viewport;
+
+// Clear flags
+typedef enum ClearFlags {
+    CLEAR_COLOR   = 0x01,
+    CLEAR_DEPTH   = 0x02,
+    CLEAR_STENCIL = 0x04,
+    CLEAR_ALL     = 0x07
+} ClearFlags;
+
+// Shader source
+typedef struct ShaderSource {
+    const char* vertex_source;
+    const char* fragment_source;
+    const char* geometry_source;  // Optional
+    const char* compute_source;   // Optional
+    const char* include_path;     // For #include directives
+} ShaderSource;
+
+// Material property
+typedef struct MaterialProperty {
+    const char* name;
+    UniformType type;
+    union {
+        float f;
+        Vec2 v2;
+        Vec3 v3;
+        Vec4 v4;
+        int i;
+        int iv2[2];
+        int iv3[3];
+        int iv4[4];
+        Mat3 m3;
+        Mat4 m4;
+        TextureHandle texture;
+    } value;
+} MaterialProperty;
+
+// Material descriptor
+typedef struct MaterialDesc {
+    ShaderHandle shader;
+    MaterialProperty* properties;
+    size_t property_count;
+    RenderState render_state;
+    const char* name;
+} MaterialDesc;
+
+// Mesh data
+typedef struct MeshData {
+    void* vertices;
+    size_t vertex_count;
+    size_t vertex_size;
+    VertexFormat format;
+    uint32_t* indices;
+    size_t index_count;
+    PrimitiveType primitive;
+} MeshData;
+
+// Texture descriptor
+typedef struct TextureDesc {
+    uint32_t width;
+    uint32_t height;
+    uint32_t depth;  // For 3D textures
+    TextureFormat format;
+    TextureFilter filter;
+    TextureWrap wrap_u;
+    TextureWrap wrap_v;
+    TextureWrap wrap_w;
+    bool generate_mipmaps;
+    uint32_t mip_count;
+    const void* data;
+    size_t data_size;
+    const char* name;
+} TextureDesc;
+
+// Render target descriptor
+typedef struct RenderTargetDesc {
+    uint32_t width;
+    uint32_t height;
+    TextureFormat color_format;
+    TextureFormat depth_format;
+    uint32_t sample_count;  // For MSAA
+    uint32_t color_attachment_count;
+    const char* name;
+} RenderTargetDesc;
+
+// Draw call
+typedef struct DrawCall {
+    MeshHandle mesh;
+    MaterialHandle material;
+    Mat4 transform;
+    uint32_t instance_count;
+    void* instance_data;
+    size_t instance_data_size;
+} DrawCall;
+
+// Render command types
+typedef enum RenderCommandType {
+    RENDER_CMD_CLEAR,
+    RENDER_CMD_SET_VIEWPORT,
+    RENDER_CMD_SET_RENDER_TARGET,
+    RENDER_CMD_DRAW,
+    RENDER_CMD_DRAW_INDEXED,
+    RENDER_CMD_DRAW_INSTANCED,
+    RENDER_CMD_DISPATCH_COMPUTE,
+    RENDER_CMD_COPY_TEXTURE,
+    RENDER_CMD_GENERATE_MIPMAPS,
+    RENDER_CMD_BEGIN_DEBUG_MARKER,
+    RENDER_CMD_END_DEBUG_MARKER,
+    RENDER_CMD_COUNT
+} RenderCommandType;
+
+// Command structures
+typedef struct ClearCommand {
+    ClearFlags flags;
+    Vec4 color;
+    float depth;
+    uint8_t stencil;
+} ClearCommand;
+
+typedef struct SetViewportCommand {
+    Viewport viewport;
+} SetViewportCommand;
+
+typedef struct SetRenderTargetCommand {
+    RenderTargetHandle target;
+} SetRenderTargetCommand;
+
+typedef struct DrawCommand {
+    MeshHandle mesh;
+    MaterialHandle material;
+    Mat4 transform;
+    uint32_t vertex_count;
+    uint32_t first_vertex;
+} DrawCommand;
+
+typedef struct DrawIndexedCommand {
+    MeshHandle mesh;
+    MaterialHandle material;
+    Mat4 transform;
+    uint32_t index_count;
+    uint32_t first_index;
+    int32_t vertex_offset;
+} DrawIndexedCommand;
+
+typedef struct DrawInstancedCommand {
+    MeshHandle mesh;
+    MaterialHandle material;
+    Mat4* transforms;
+    uint32_t instance_count;
+} DrawInstancedCommand;
+
+typedef struct DispatchComputeCommand {
+    ShaderHandle compute_shader;
+    uint32_t group_count_x;
+    uint32_t group_count_y;
+    uint32_t group_count_z;
+} DispatchComputeCommand;
+
+typedef struct CopyTextureCommand {
+    TextureHandle source;
+    TextureHandle destination;
+    uint32_t src_level;
+    uint32_t dst_level;
+} CopyTextureCommand;
+
+typedef struct GenerateMipmapsCommand {
+    TextureHandle texture;
+} GenerateMipmapsCommand;
+
+typedef struct DebugMarkerCommand {
+    const char* name;
+    Vec4 color;
+} DebugMarkerCommand;
+
+// Render command
+struct RenderCommand {
+    RenderCommandType type;
+    union {
+        ClearCommand clear;
+        SetViewportCommand viewport;
+        SetRenderTargetCommand render_target;
+        DrawCommand draw;
+        DrawIndexedCommand draw_indexed;
+        DrawInstancedCommand draw_instanced;
+        DispatchComputeCommand dispatch;
+        CopyTextureCommand copy;
+        GenerateMipmapsCommand mipmaps;
+        DebugMarkerCommand debug_marker;
+    } data;
+};
+
+// Render statistics
+typedef struct RenderStats {
+    uint32_t draw_calls;
+    uint32_t triangles;
+    uint32_t vertices;
+    uint32_t state_changes;
+    uint32_t texture_binds;
+    uint32_t shader_binds;
+    uint32_t render_target_changes;
+    uint64_t gpu_memory_used;
+    float frame_time_ms;
+    float gpu_time_ms;
+} RenderStats;
+
+// Shader hot reload callback
+typedef void (*ShaderReloadCallback)(ShaderHandle shader, void* user_data);
+
+// Renderer API
+typedef struct RendererAPI {
+    // Initialization
+    Renderer* (*create)(MemoryArena* arena, void* window_handle, uint32_t width, uint32_t height);
+    void (*destroy)(Renderer* renderer);
+    void (*resize)(Renderer* renderer, uint32_t width, uint32_t height);
+    
+    // Frame control
+    void (*begin_frame)(Renderer* renderer);
+    void (*end_frame)(Renderer* renderer);
+    void (*present)(Renderer* renderer, bool vsync);
+    
+    // Command buffer
+    RenderCommand* (*push_command)(Renderer* renderer);
+    void (*submit_commands)(Renderer* renderer);
+    void (*flush_commands)(Renderer* renderer);
+    void (*clear_commands)(Renderer* renderer);
+    
+    // Resource creation
+    ShaderHandle (*create_shader)(Renderer* renderer, const ShaderSource* source);
+    TextureHandle (*create_texture)(Renderer* renderer, const TextureDesc* desc);
+    MeshHandle (*create_mesh)(Renderer* renderer, const MeshData* data);
+    MaterialHandle (*create_material)(Renderer* renderer, const MaterialDesc* desc);
+    RenderTargetHandle (*create_render_target)(Renderer* renderer, const RenderTargetDesc* desc);
+    
+    // Resource updates
+    void (*update_texture)(Renderer* renderer, TextureHandle handle, const void* data, size_t size);
+    void (*update_mesh)(Renderer* renderer, MeshHandle handle, const MeshData* data);
+    void (*update_material)(Renderer* renderer, MaterialHandle handle, const MaterialProperty* props, size_t count);
+    
+    // Resource destruction
+    void (*destroy_shader)(Renderer* renderer, ShaderHandle handle);
+    void (*destroy_texture)(Renderer* renderer, TextureHandle handle);
+    void (*destroy_mesh)(Renderer* renderer, MeshHandle handle);
+    void (*destroy_material)(Renderer* renderer, MaterialHandle handle);
+    void (*destroy_render_target)(Renderer* renderer, RenderTargetHandle handle);
+    
+    // Resource queries
+    bool (*is_shader_valid)(Renderer* renderer, ShaderHandle handle);
+    bool (*is_texture_valid)(Renderer* renderer, TextureHandle handle);
+    bool (*is_mesh_valid)(Renderer* renderer, MeshHandle handle);
+    bool (*is_material_valid)(Renderer* renderer, MaterialHandle handle);
+    bool (*is_render_target_valid)(Renderer* renderer, RenderTargetHandle handle);
+    
+    // Hot reload
+    void (*register_shader_reload_callback)(Renderer* renderer, ShaderReloadCallback callback, void* user_data);
+    void (*reload_shader)(Renderer* renderer, ShaderHandle handle, const ShaderSource* source);
+    void (*reload_all_shaders)(Renderer* renderer);
+    
+    // Debug
+    void (*push_debug_group)(Renderer* renderer, const char* name);
+    void (*pop_debug_group)(Renderer* renderer);
+    void (*set_debug_name)(Renderer* renderer, void* object, const char* name);
+    
+    // Statistics
+    RenderStats (*get_stats)(Renderer* renderer);
+    void (*reset_stats)(Renderer* renderer);
+    
+    // Immediate mode helpers
+    void (*draw_mesh)(Renderer* renderer, MeshHandle mesh, MaterialHandle material, const Mat4* transform);
+    void (*draw_fullscreen_quad)(Renderer* renderer, MaterialHandle material);
+    void (*draw_debug_line)(Renderer* renderer, Vec3 from, Vec3 to, Color color);
+    void (*draw_debug_box)(Renderer* renderer, Vec3 center, Vec3 extents, Color color);
+    void (*draw_debug_sphere)(Renderer* renderer, Vec3 center, float radius, Color color);
+} RendererAPI;
+
+// Global renderer API (set by renderer implementation)
+extern RendererAPI* g_renderer_api;
+
+// Convenience macros
+#define renderer_create(...) g_renderer_api->create(__VA_ARGS__)
+#define renderer_destroy(...) g_renderer_api->destroy(__VA_ARGS__)
+#define renderer_begin_frame(...) g_renderer_api->begin_frame(__VA_ARGS__)
+#define renderer_end_frame(...) g_renderer_api->end_frame(__VA_ARGS__)
+#define renderer_present(...) g_renderer_api->present(__VA_ARGS__)
+#define renderer_push_command(...) g_renderer_api->push_command(__VA_ARGS__)
+#define renderer_submit_commands(...) g_renderer_api->submit_commands(__VA_ARGS__)
+#define renderer_create_shader(...) g_renderer_api->create_shader(__VA_ARGS__)
+#define renderer_create_texture(...) g_renderer_api->create_texture(__VA_ARGS__)
+#define renderer_create_mesh(...) g_renderer_api->create_mesh(__VA_ARGS__)
+#define renderer_create_material(...) g_renderer_api->create_material(__VA_ARGS__)
+#define renderer_reload_shader(...) g_renderer_api->reload_shader(__VA_ARGS__)
+#define renderer_draw_mesh(...) g_renderer_api->draw_mesh(__VA_ARGS__)
+
+#endif // RENDERER_H

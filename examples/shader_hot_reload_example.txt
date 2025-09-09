@@ -1,0 +1,539 @@
+#include "renderer.h"
+#include "platform.h"
+#include "memory.h"
+#include <stdio.h>
+#include <string.h>
+
+// Example shader files that will be watched for changes
+#define SHADER_DIR "assets/shaders/"
+
+// Shader manager for organizing shaders
+typedef struct ShaderManager {
+    Renderer* renderer;
+    MemoryArena* arena;
+    
+    // Common shaders
+    ShaderHandle standard_shader;
+    ShaderHandle pbr_shader;
+    ShaderHandle unlit_shader;
+    ShaderHandle wireframe_shader;
+    ShaderHandle debug_shader;
+    
+    // Effect shaders
+    ShaderHandle bloom_shader;
+    ShaderHandle fxaa_shader;
+    ShaderHandle tone_mapping_shader;
+    ShaderHandle gaussian_blur_shader;
+    
+    // Compute shaders
+    ShaderHandle particle_update_shader;
+    ShaderHandle ssao_shader;
+    
+    // Shader compile statistics
+    uint32_t compile_success_count;
+    uint32_t compile_fail_count;
+    uint32_t total_reload_time_ms;
+} ShaderManager;
+
+// Create shader with hot reload support
+static ShaderHandle create_hot_reload_shader(Renderer* renderer, const char* name) {
+    char vertex_path[256];
+    char fragment_path[256];
+    
+    snprintf(vertex_path, sizeof(vertex_path), "%s%s.vert", SHADER_DIR, name);
+    snprintf(fragment_path, sizeof(fragment_path), "%s%s.frag", SHADER_DIR, name);
+    
+    // Read shader files
+    char* vertex_source = NULL;
+    char* fragment_source = NULL;
+    
+    PlatformFile vfile = platform_open_file(vertex_path, FILE_MODE_READ);
+    if (vfile.handle) {
+        size_t size = platform_get_file_size(&vfile);
+        vertex_source = (char*)malloc(size + 1);
+        platform_read_file(&vfile, vertex_source, size);
+        vertex_source[size] = '\0';
+        platform_close_file(&vfile);
+    }
+    
+    PlatformFile ffile = platform_open_file(fragment_path, FILE_MODE_READ);
+    if (ffile.handle) {
+        size_t size = platform_get_file_size(&ffile);
+        fragment_source = (char*)malloc(size + 1);
+        platform_read_file(&ffile, fragment_source, size);
+        fragment_source[size] = '\0';
+        platform_close_file(&ffile);
+    }
+    
+    ShaderSource source = {
+        .vertex_source = vertex_source,
+        .fragment_source = fragment_source,
+        .include_path = SHADER_DIR
+    };
+    
+    ShaderHandle handle = renderer_create_shader(renderer, &source);
+    
+    free(vertex_source);
+    free(fragment_source);
+    
+    if (handle.id != 0) {
+        printf("Shader '%s' loaded successfully (watching for changes)\n", name);
+    } else {
+        printf("Failed to load shader '%s'\n", name);
+    }
+    
+    return handle;
+}
+
+// Initialize shader manager
+ShaderManager* shader_manager_create(MemoryArena* arena, Renderer* renderer) {
+    ShaderManager* manager = arena_push_struct(arena, ShaderManager);
+    memset(manager, 0, sizeof(ShaderManager));
+    
+    manager->renderer = renderer;
+    manager->arena = arena;
+    
+    // Load all shaders with hot reload support
+    manager->standard_shader = create_hot_reload_shader(renderer, "standard");
+    manager->pbr_shader = create_hot_reload_shader(renderer, "pbr");
+    manager->unlit_shader = create_hot_reload_shader(renderer, "unlit");
+    manager->wireframe_shader = create_hot_reload_shader(renderer, "wireframe");
+    manager->debug_shader = create_hot_reload_shader(renderer, "debug");
+    
+    // Post-processing shaders
+    manager->bloom_shader = create_hot_reload_shader(renderer, "bloom");
+    manager->fxaa_shader = create_hot_reload_shader(renderer, "fxaa");
+    manager->tone_mapping_shader = create_hot_reload_shader(renderer, "tone_mapping");
+    manager->gaussian_blur_shader = create_hot_reload_shader(renderer, "gaussian_blur");
+    
+    printf("Shader Manager initialized with hot reload support\n");
+    
+    return manager;
+}
+
+// Example PBR shader source (would normally be in files)
+const char* example_pbr_vertex_shader = 
+    "#version 450 core\n"
+    "\n"
+    "layout(location = 0) in vec3 a_Position;\n"
+    "layout(location = 1) in vec3 a_Normal;\n"
+    "layout(location = 2) in vec2 a_TexCoord;\n"
+    "layout(location = 3) in vec3 a_Tangent;\n"
+    "layout(location = 4) in vec3 a_Bitangent;\n"
+    "\n"
+    "uniform mat4 u_MVP;\n"
+    "uniform mat4 u_Model;\n"
+    "uniform mat3 u_NormalMatrix;\n"
+    "\n"
+    "out VS_OUT {\n"
+    "    vec3 FragPos;\n"
+    "    vec2 TexCoord;\n"
+    "    vec3 Normal;\n"
+    "    vec3 Tangent;\n"
+    "    vec3 Bitangent;\n"
+    "    mat3 TBN;\n"
+    "} vs_out;\n"
+    "\n"
+    "void main() {\n"
+    "    gl_Position = u_MVP * vec4(a_Position, 1.0);\n"
+    "    vs_out.FragPos = vec3(u_Model * vec4(a_Position, 1.0));\n"
+    "    vs_out.TexCoord = a_TexCoord;\n"
+    "    \n"
+    "    // Transform normals\n"
+    "    vs_out.Normal = normalize(u_NormalMatrix * a_Normal);\n"
+    "    vs_out.Tangent = normalize(u_NormalMatrix * a_Tangent);\n"
+    "    vs_out.Bitangent = normalize(u_NormalMatrix * a_Bitangent);\n"
+    "    \n"
+    "    // Create TBN matrix for normal mapping\n"
+    "    vs_out.TBN = mat3(vs_out.Tangent, vs_out.Bitangent, vs_out.Normal);\n"
+    "}\n";
+
+const char* example_pbr_fragment_shader = 
+    "#version 450 core\n"
+    "\n"
+    "in VS_OUT {\n"
+    "    vec3 FragPos;\n"
+    "    vec2 TexCoord;\n"
+    "    vec3 Normal;\n"
+    "    vec3 Tangent;\n"
+    "    vec3 Bitangent;\n"
+    "    mat3 TBN;\n"
+    "} fs_in;\n"
+    "\n"
+    "// Material parameters (live editable!)\n"
+    "uniform vec4 u_BaseColor;\n"
+    "uniform float u_Metallic;\n"
+    "uniform float u_Roughness;\n"
+    "uniform float u_AO;\n"
+    "uniform float u_EmissiveIntensity;\n"
+    "uniform vec3 u_EmissiveColor;\n"
+    "\n"
+    "// Textures\n"
+    "uniform sampler2D u_BaseColorMap;\n"
+    "uniform sampler2D u_NormalMap;\n"
+    "uniform sampler2D u_MetallicRoughnessMap;\n"
+    "uniform sampler2D u_AOMap;\n"
+    "uniform sampler2D u_EmissiveMap;\n"
+    "\n"
+    "// Environment\n"
+    "uniform vec3 u_CameraPos;\n"
+    "uniform vec3 u_LightPositions[4];\n"
+    "uniform vec3 u_LightColors[4];\n"
+    "uniform float u_LightIntensities[4];\n"
+    "uniform int u_LightCount;\n"
+    "\n"
+    "// IBL\n"
+    "uniform samplerCube u_IrradianceMap;\n"
+    "uniform samplerCube u_PrefilterMap;\n"
+    "uniform sampler2D u_BRDFLut;\n"
+    "\n"
+    "// Debug options (hot reload to toggle!)\n"
+    "uniform bool u_ShowNormals;\n"
+    "uniform bool u_ShowUVs;\n"
+    "uniform bool u_ShowRoughness;\n"
+    "uniform bool u_ShowMetallic;\n"
+    "\n"
+    "out vec4 FragColor;\n"
+    "\n"
+    "const float PI = 3.14159265359;\n"
+    "\n"
+    "// PBR functions\n"
+    "float DistributionGGX(vec3 N, vec3 H, float roughness) {\n"
+    "    float a = roughness * roughness;\n"
+    "    float a2 = a * a;\n"
+    "    float NdotH = max(dot(N, H), 0.0);\n"
+    "    float NdotH2 = NdotH * NdotH;\n"
+    "    \n"
+    "    float num = a2;\n"
+    "    float denom = (NdotH2 * (a2 - 1.0) + 1.0);\n"
+    "    denom = PI * denom * denom;\n"
+    "    \n"
+    "    return num / denom;\n"
+    "}\n"
+    "\n"
+    "float GeometrySchlickGGX(float NdotV, float roughness) {\n"
+    "    float r = (roughness + 1.0);\n"
+    "    float k = (r * r) / 8.0;\n"
+    "    \n"
+    "    float num = NdotV;\n"
+    "    float denom = NdotV * (1.0 - k) + k;\n"
+    "    \n"
+    "    return num / denom;\n"
+    "}\n"
+    "\n"
+    "float GeometrySmith(vec3 N, vec3 V, vec3 L, float roughness) {\n"
+    "    float NdotV = max(dot(N, V), 0.0);\n"
+    "    float NdotL = max(dot(N, L), 0.0);\n"
+    "    float ggx2 = GeometrySchlickGGX(NdotV, roughness);\n"
+    "    float ggx1 = GeometrySchlickGGX(NdotL, roughness);\n"
+    "    \n"
+    "    return ggx1 * ggx2;\n"
+    "}\n"
+    "\n"
+    "vec3 fresnelSchlick(float cosTheta, vec3 F0) {\n"
+    "    return F0 + (1.0 - F0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);\n"
+    "}\n"
+    "\n"
+    "vec3 fresnelSchlickRoughness(float cosTheta, vec3 F0, float roughness) {\n"
+    "    return F0 + (max(vec3(1.0 - roughness), F0) - F0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);\n"
+    "}\n"
+    "\n"
+    "void main() {\n"
+    "    // Sample textures\n"
+    "    vec3 albedo = pow(texture(u_BaseColorMap, fs_in.TexCoord).rgb, vec2(2.2));\n"
+    "    albedo *= u_BaseColor.rgb;\n"
+    "    \n"
+    "    vec3 normal = texture(u_NormalMap, fs_in.TexCoord).rgb;\n"
+    "    normal = normalize(normal * 2.0 - 1.0);\n"
+    "    normal = normalize(fs_in.TBN * normal);\n"
+    "    \n"
+    "    vec3 metallicRoughness = texture(u_MetallicRoughnessMap, fs_in.TexCoord).rgb;\n"
+    "    float metallic = metallicRoughness.b * u_Metallic;\n"
+    "    float roughness = metallicRoughness.g * u_Roughness;\n"
+    "    float ao = texture(u_AOMap, fs_in.TexCoord).r * u_AO;\n"
+    "    \n"
+    "    vec3 emissive = texture(u_EmissiveMap, fs_in.TexCoord).rgb * u_EmissiveColor * u_EmissiveIntensity;\n"
+    "    \n"
+    "    // Debug visualization modes (change shader and see instant results!)\n"
+    "    if (u_ShowNormals) {\n"
+    "        FragColor = vec4(normal * 0.5 + 0.5, 1.0);\n"
+    "        return;\n"
+    "    }\n"
+    "    if (u_ShowUVs) {\n"
+    "        FragColor = vec4(fs_in.TexCoord, 0.0, 1.0);\n"
+    "        return;\n"
+    "    }\n"
+    "    if (u_ShowRoughness) {\n"
+    "        FragColor = vec4(vec3(roughness), 1.0);\n"
+    "        return;\n"
+    "    }\n"
+    "    if (u_ShowMetallic) {\n"
+    "        FragColor = vec4(vec3(metallic), 1.0);\n"
+    "        return;\n"
+    "    }\n"
+    "    \n"
+    "    // PBR calculations\n"
+    "    vec3 N = normal;\n"
+    "    vec3 V = normalize(u_CameraPos - fs_in.FragPos);\n"
+    "    vec3 R = reflect(-V, N);\n"
+    "    \n"
+    "    vec3 F0 = vec3(0.04);\n"
+    "    F0 = mix(F0, albedo, metallic);\n"
+    "    \n"
+    "    // Direct lighting\n"
+    "    vec3 Lo = vec3(0.0);\n"
+    "    for (int i = 0; i < u_LightCount; ++i) {\n"
+    "        vec3 L = normalize(u_LightPositions[i] - fs_in.FragPos);\n"
+    "        vec3 H = normalize(V + L);\n"
+    "        float distance = length(u_LightPositions[i] - fs_in.FragPos);\n"
+    "        float attenuation = 1.0 / (distance * distance);\n"
+    "        vec3 radiance = u_LightColors[i] * u_LightIntensities[i] * attenuation;\n"
+    "        \n"
+    "        float NDF = DistributionGGX(N, H, roughness);\n"
+    "        float G = GeometrySmith(N, V, L, roughness);\n"
+    "        vec3 F = fresnelSchlick(max(dot(H, V), 0.0), F0);\n"
+    "        \n"
+    "        vec3 kS = F;\n"
+    "        vec3 kD = vec3(1.0) - kS;\n"
+    "        kD *= 1.0 - metallic;\n"
+    "        \n"
+    "        vec3 numerator = NDF * G * F;\n"
+    "        float denominator = 4.0 * max(dot(N, V), 0.0) * max(dot(N, L), 0.0) + 0.0001;\n"
+    "        vec3 specular = numerator / denominator;\n"
+    "        \n"
+    "        float NdotL = max(dot(N, L), 0.0);\n"
+    "        Lo += (kD * albedo / PI + specular) * radiance * NdotL;\n"
+    "    }\n"
+    "    \n"
+    "    // IBL\n"
+    "    vec3 F = fresnelSchlickRoughness(max(dot(N, V), 0.0), F0, roughness);\n"
+    "    vec3 kS = F;\n"
+    "    vec3 kD = 1.0 - kS;\n"
+    "    kD *= 1.0 - metallic;\n"
+    "    \n"
+    "    vec3 irradiance = texture(u_IrradianceMap, N).rgb;\n"
+    "    vec3 diffuse = irradiance * albedo;\n"
+    "    \n"
+    "    const float MAX_REFLECTION_LOD = 4.0;\n"
+    "    vec3 prefilteredColor = textureLod(u_PrefilterMap, R, roughness * MAX_REFLECTION_LOD).rgb;\n"
+    "    vec2 brdf = texture(u_BRDFLut, vec2(max(dot(N, V), 0.0), roughness)).rg;\n"
+    "    vec3 specular = prefilteredColor * (F * brdf.x + brdf.y);\n"
+    "    \n"
+    "    vec3 ambient = (kD * diffuse + specular) * ao;\n"
+    "    vec3 color = ambient + Lo + emissive;\n"
+    "    \n"
+    "    // Tone mapping (can be modified live!)\n"
+    "    color = color / (color + vec3(1.0));\n"
+    "    color = pow(color, vec3(1.0/2.2));\n"
+    "    \n"
+    "    FragColor = vec4(color, u_BaseColor.a);\n"
+    "}\n";
+
+// Save example shader files
+void create_example_shader_files(const char* shader_dir) {
+    // Create directory if it doesn't exist
+    platform_create_directory(shader_dir);
+    
+    // Save PBR shader
+    char path[256];
+    
+    snprintf(path, sizeof(path), "%spbr.vert", shader_dir);
+    PlatformFile vfile = platform_open_file(path, FILE_MODE_WRITE);
+    if (vfile.handle) {
+        platform_write_file(&vfile, example_pbr_vertex_shader, strlen(example_pbr_vertex_shader));
+        platform_close_file(&vfile);
+        printf("Created shader file: %s\n", path);
+    }
+    
+    snprintf(path, sizeof(path), "%spbr.frag", shader_dir);
+    PlatformFile ffile = platform_open_file(path, FILE_MODE_WRITE);
+    if (ffile.handle) {
+        platform_write_file(&ffile, example_pbr_fragment_shader, strlen(example_pbr_fragment_shader));
+        platform_close_file(&ffile);
+        printf("Created shader file: %s\n", path);
+    }
+    
+    // Create a simple unlit shader
+    const char* unlit_vertex = 
+        "#version 330 core\n"
+        "layout(location = 0) in vec3 a_Position;\n"
+        "layout(location = 2) in vec2 a_TexCoord;\n"
+        "uniform mat4 u_MVP;\n"
+        "out vec2 v_TexCoord;\n"
+        "void main() {\n"
+        "    gl_Position = u_MVP * vec4(a_Position, 1.0);\n"
+        "    v_TexCoord = a_TexCoord;\n"
+        "}\n";
+    
+    const char* unlit_fragment = 
+        "#version 330 core\n"
+        "in vec2 v_TexCoord;\n"
+        "uniform vec4 u_Color;\n"
+        "uniform sampler2D u_Texture;\n"
+        "out vec4 FragColor;\n"
+        "void main() {\n"
+        "    vec4 texColor = texture(u_Texture, v_TexCoord);\n"
+        "    FragColor = texColor * u_Color;\n"
+        "}\n";
+    
+    snprintf(path, sizeof(path), "%sunlit.vert", shader_dir);
+    vfile = platform_open_file(path, FILE_MODE_WRITE);
+    if (vfile.handle) {
+        platform_write_file(&vfile, unlit_vertex, strlen(unlit_vertex));
+        platform_close_file(&vfile);
+        printf("Created shader file: %s\n", path);
+    }
+    
+    snprintf(path, sizeof(path), "%sunlit.frag", shader_dir);
+    ffile = platform_open_file(path, FILE_MODE_WRITE);
+    if (ffile.handle) {
+        platform_write_file(&ffile, unlit_fragment, strlen(unlit_fragment));
+        platform_close_file(&ffile);
+        printf("Created shader file: %s\n", path);
+    }
+}
+
+// Shader reload callback
+static void on_shader_reloaded(ShaderHandle shader, void* user_data) {
+    ShaderManager* manager = (ShaderManager*)user_data;
+    
+    uint64_t start_time = platform_get_time();
+    
+    // Update statistics
+    manager->compile_success_count++;
+    
+    uint64_t end_time = platform_get_time();
+    uint32_t reload_time = (uint32_t)((end_time - start_time) / 1000); // Convert to ms
+    manager->total_reload_time_ms += reload_time;
+    
+    printf("=== SHADER HOT RELOAD ===\n");
+    printf("  Shader ID: %d\n", shader.id);
+    printf("  Generation: %d\n", shader.generation);
+    printf("  Reload time: %d ms\n", reload_time);
+    printf("  Total reloads: %d\n", manager->compile_success_count);
+    printf("  Average time: %d ms\n", 
+           manager->total_reload_time_ms / (manager->compile_success_count ? manager->compile_success_count : 1));
+    printf("========================\n");
+}
+
+// Demo application showing live shader editing
+void run_shader_hot_reload_demo(MemoryArena* arena, void* window_handle) {
+    // Initialize renderer
+    Renderer* renderer = renderer_create(arena, window_handle, 1920, 1080);
+    
+    // Create shader manager
+    ShaderManager* shader_manager = shader_manager_create(arena, renderer);
+    
+    // Register reload callback
+    renderer_register_shader_reload_callback(renderer, on_shader_reloaded, shader_manager);
+    
+    // Create example shader files
+    create_example_shader_files(SHADER_DIR);
+    
+    // Create demo scene
+    MeshHandle sphere = create_sphere_mesh(renderer, 1.0f, 64, 32);
+    
+    // Create materials using hot-reloadable shaders
+    MaterialProperty pbr_props[] = {
+        {"u_BaseColor", UNIFORM_TYPE_VEC4, .value.v4 = {1.0f, 0.5f, 0.3f, 1.0f}},
+        {"u_Metallic", UNIFORM_TYPE_FLOAT, .value.f = 0.8f},
+        {"u_Roughness", UNIFORM_TYPE_FLOAT, .value.f = 0.2f},
+        {"u_AO", UNIFORM_TYPE_FLOAT, .value.f = 1.0f}
+    };
+    
+    MaterialDesc pbr_mat_desc = {
+        .shader = shader_manager->pbr_shader,
+        .properties = pbr_props,
+        .property_count = 4,
+        .render_state = {
+            .blend_mode = BLEND_MODE_OPAQUE,
+            .cull_mode = CULL_MODE_BACK,
+            .depth_test = DEPTH_TEST_LESS,
+            .depth_write = true
+        },
+        .name = "PBR Material"
+    };
+    
+    MaterialHandle pbr_material = renderer_create_material(renderer, &pbr_mat_desc);
+    
+    printf("\n");
+    printf("╔════════════════════════════════════════════════════════════╗\n");
+    printf("║           SHADER HOT RELOAD DEMO - INSTRUCTIONS           ║\n");
+    printf("╠════════════════════════════════════════════════════════════╣\n");
+    printf("║ 1. Open any .vert or .frag file in: %s%-17s║\n", SHADER_DIR, "");
+    printf("║ 2. Edit the shader code (try changing colors/effects)     ║\n");
+    printf("║ 3. Save the file - changes appear instantly!              ║\n");
+    printf("║                                                            ║\n");
+    printf("║ Example changes to try:                                   ║\n");
+    printf("║   • Change FragColor output in fragment shader            ║\n");
+    printf("║   • Modify lighting calculations                          ║\n");
+    printf("║   • Add new uniform variables                             ║\n");
+    printf("║   • Toggle debug visualization modes                      ║\n");
+    printf("║   • Adjust tone mapping or color grading                  ║\n");
+    printf("║                                                            ║\n");
+    printf("║ The renderer will:                                        ║\n");
+    printf("║   • Detect file changes automatically                     ║\n");
+    printf("║   • Recompile shaders on the fly                         ║\n");
+    printf("║   • Preserve all material properties                      ║\n");
+    printf("║   • Show compilation errors if any                        ║\n");
+    printf("╚════════════════════════════════════════════════════════════╝\n");
+    printf("\n");
+    
+    // Main render loop
+    bool running = true;
+    uint64_t last_time = platform_get_time();
+    float time = 0.0f;
+    
+    while (running) {
+        uint64_t current_time = platform_get_time();
+        float dt = (float)(current_time - last_time) / 1000000.0f; // Convert to seconds
+        last_time = current_time;
+        time += dt;
+        
+        // Begin frame (checks for shader reloads)
+        renderer_begin_frame(renderer);
+        
+        // Clear screen
+        RenderCommand* cmd = renderer_push_command(renderer);
+        cmd->type = RENDER_CMD_CLEAR;
+        cmd->data.clear.flags = CLEAR_ALL;
+        cmd->data.clear.color = (Vec4){0.1f, 0.1f, 0.15f, 1.0f};
+        cmd->data.clear.depth = 1.0f;
+        
+        // Animate sphere rotation
+        Mat4 transform;
+        memset(&transform, 0, sizeof(Mat4));
+        float angle = time * 0.5f;
+        transform.m[0] = cosf(angle);
+        transform.m[2] = sinf(angle);
+        transform.m[5] = 1.0f;
+        transform.m[8] = -sinf(angle);
+        transform.m[10] = cosf(angle);
+        transform.m[15] = 1.0f;
+        
+        // Draw sphere with PBR material
+        renderer_draw_mesh(renderer, sphere, pbr_material, &transform);
+        
+        // Submit and present
+        renderer_end_frame(renderer);
+        renderer_present(renderer, true);
+        
+        // Handle platform events
+        PlatformEvent event;
+        while (platform_poll_event(&event)) {
+            if (event.type == PLATFORM_EVENT_QUIT) {
+                running = false;
+            }
+        }
+    }
+    
+    // Print final statistics
+    printf("\nShader Hot Reload Statistics:\n");
+    printf("  Successful reloads: %d\n", shader_manager->compile_success_count);
+    printf("  Failed reloads: %d\n", shader_manager->compile_fail_count);
+    printf("  Total reload time: %d ms\n", shader_manager->total_reload_time_ms);
+    printf("  Average reload time: %d ms\n", 
+           shader_manager->total_reload_time_ms / (shader_manager->compile_success_count ? shader_manager->compile_success_count : 1));
+    
+    renderer_destroy(renderer);
+}

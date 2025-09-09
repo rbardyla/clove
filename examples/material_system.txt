@@ -1,0 +1,727 @@
+#include "renderer.h"
+#include "platform.h"
+#include "memory.h"
+#include <string.h>
+#include <stdio.h>
+#include <math.h>
+
+#define MAX_MATERIAL_TEMPLATES 256
+#define MAX_MATERIAL_INSTANCES 4096
+#define MAX_TEXTURE_SLOTS 16
+#define MAX_MATERIAL_PARAMS 64
+#define PREVIEW_SIZE 256
+
+// Material parameter types with metadata
+typedef enum MaterialParamType {
+    MATERIAL_PARAM_FLOAT,
+    MATERIAL_PARAM_FLOAT2,
+    MATERIAL_PARAM_FLOAT3,
+    MATERIAL_PARAM_FLOAT4,
+    MATERIAL_PARAM_COLOR,
+    MATERIAL_PARAM_TEXTURE,
+    MATERIAL_PARAM_BOOL,
+    MATERIAL_PARAM_INT,
+    MATERIAL_PARAM_ENUM,
+} MaterialParamType;
+
+// Material parameter descriptor
+typedef struct MaterialParamDesc {
+    char name[64];
+    char display_name[64];
+    MaterialParamType type;
+    
+    union {
+        struct { float min, max, default_val; } float_range;
+        struct { Vec2 min, max, default_val; } float2_range;
+        struct { Vec3 min, max, default_val; } float3_range;
+        struct { Vec4 min, max, default_val; } float4_range;
+        struct { Vec4 default_val; } color;
+        struct { char path[256]; TextureHandle handle; } texture;
+        struct { bool default_val; } boolean;
+        struct { int min, max, default_val; } int_range;
+        struct { char options[8][32]; int count, default_val; } enum_options;
+    } data;
+    
+    // UI hints
+    float ui_step;
+    bool ui_logarithmic;
+    char ui_group[32];
+    char ui_tooltip[256];
+} MaterialParamDesc;
+
+// Material template (defines the structure)
+typedef struct MaterialTemplate {
+    char name[64];
+    char category[32];
+    ShaderHandle shader;
+    
+    MaterialParamDesc params[MAX_MATERIAL_PARAMS];
+    uint32_t param_count;
+    
+    // Default render state
+    RenderState default_state;
+    
+    // Preview settings
+    MeshHandle preview_mesh;
+    Mat4 preview_transform;
+    Vec3 preview_light_dir;
+    
+    // Shader paths for hot reload
+    char vertex_path[256];
+    char fragment_path[256];
+} MaterialTemplate;
+
+// Material instance (actual values)
+typedef struct MaterialInstance {
+    MaterialTemplate* template_ref;
+    MaterialHandle renderer_handle;
+    
+    // Parameter values
+    union {
+        float f;
+        Vec2 v2;
+        Vec3 v3;
+        Vec4 v4;
+        Color c;
+        TextureHandle tex;
+        bool b;
+        int i;
+    } values[MAX_MATERIAL_PARAMS];
+    
+    // Preview
+    RenderTargetHandle preview_target;
+    TextureHandle preview_texture;
+    bool preview_dirty;
+    uint64_t last_preview_time;
+    
+    // Override state
+    RenderState render_state;
+    bool state_override;
+} MaterialInstance;
+
+// Material library
+typedef struct MaterialLibrary {
+    char name[64];
+    MaterialTemplate* templates[MAX_MATERIAL_TEMPLATES];
+    uint32_t template_count;
+    
+    MaterialInstance* instances[MAX_MATERIAL_INSTANCES];
+    uint32_t instance_count;
+} MaterialLibrary;
+
+// Material system
+typedef struct MaterialSystem {
+    MemoryArena* arena;
+    Renderer* renderer;
+    
+    // Templates and instances
+    MaterialTemplate templates[MAX_MATERIAL_TEMPLATES];
+    uint32_t template_count;
+    
+    MaterialInstance instances[MAX_MATERIAL_INSTANCES];
+    uint32_t instance_count;
+    
+    // Libraries
+    MaterialLibrary* libraries[16];
+    uint32_t library_count;
+    
+    // Preview resources
+    MeshHandle preview_sphere;
+    MeshHandle preview_cube;
+    MeshHandle preview_plane;
+    MeshHandle preview_cylinder;
+    ShaderHandle preview_shader;
+    
+    // Live editing
+    MaterialInstance* editing_instance;
+    bool live_preview_enabled;
+    float preview_update_rate;
+    
+    // Statistics
+    uint32_t materials_created;
+    uint32_t materials_destroyed;
+    uint32_t preview_renders;
+} MaterialSystem;
+
+// Global material system
+static MaterialSystem* g_material_system = NULL;
+
+// Helper: Create preview mesh
+static MeshHandle create_sphere_mesh(Renderer* renderer, float radius, uint32_t segments, uint32_t rings) {
+    uint32_t vertex_count = (rings + 1) * (segments + 1);
+    uint32_t index_count = rings * segments * 6;
+    
+    Vertex_P3F_N3F_T2F* vertices = (Vertex_P3F_N3F_T2F*)malloc(sizeof(Vertex_P3F_N3F_T2F) * vertex_count);
+    uint32_t* indices = (uint32_t*)malloc(sizeof(uint32_t) * index_count);
+    
+    // Generate vertices
+    uint32_t v = 0;
+    for (uint32_t r = 0; r <= rings; r++) {
+        float theta = (float)r * 3.14159f / (float)rings;
+        float sin_theta = sinf(theta);
+        float cos_theta = cosf(theta);
+        
+        for (uint32_t s = 0; s <= segments; s++) {
+            float phi = (float)s * 2.0f * 3.14159f / (float)segments;
+            float sin_phi = sinf(phi);
+            float cos_phi = cosf(phi);
+            
+            vertices[v].position.x = radius * sin_theta * cos_phi;
+            vertices[v].position.y = radius * cos_theta;
+            vertices[v].position.z = radius * sin_theta * sin_phi;
+            
+            vertices[v].normal = vertices[v].position;
+            float len = sqrtf(vertices[v].normal.x * vertices[v].normal.x +
+                             vertices[v].normal.y * vertices[v].normal.y +
+                             vertices[v].normal.z * vertices[v].normal.z);
+            vertices[v].normal.x /= len;
+            vertices[v].normal.y /= len;
+            vertices[v].normal.z /= len;
+            
+            vertices[v].texcoord.x = (float)s / (float)segments;
+            vertices[v].texcoord.y = (float)r / (float)rings;
+            
+            v++;
+        }
+    }
+    
+    // Generate indices
+    uint32_t i = 0;
+    for (uint32_t r = 0; r < rings; r++) {
+        for (uint32_t s = 0; s < segments; s++) {
+            uint32_t v0 = r * (segments + 1) + s;
+            uint32_t v1 = v0 + 1;
+            uint32_t v2 = v0 + segments + 1;
+            uint32_t v3 = v2 + 1;
+            
+            indices[i++] = v0;
+            indices[i++] = v2;
+            indices[i++] = v1;
+            
+            indices[i++] = v1;
+            indices[i++] = v2;
+            indices[i++] = v3;
+        }
+    }
+    
+    MeshData mesh_data = {
+        .vertices = vertices,
+        .vertex_count = vertex_count,
+        .vertex_size = sizeof(Vertex_P3F_N3F_T2F),
+        .format = VERTEX_FORMAT_P3F_N3F_T2F,
+        .indices = indices,
+        .index_count = index_count,
+        .primitive = PRIMITIVE_TRIANGLES
+    };
+    
+    MeshHandle handle = g_renderer_api->create_mesh(renderer, &mesh_data);
+    
+    free(vertices);
+    free(indices);
+    
+    return handle;
+}
+
+// Initialize material system
+MaterialSystem* material_system_create(MemoryArena* arena, Renderer* renderer) {
+    MaterialSystem* system = arena_push_struct(arena, MaterialSystem);
+    memset(system, 0, sizeof(MaterialSystem));
+    
+    system->arena = arena;
+    system->renderer = renderer;
+    system->live_preview_enabled = true;
+    system->preview_update_rate = 60.0f; // 60 FPS preview updates
+    
+    // Create preview meshes
+    system->preview_sphere = create_sphere_mesh(renderer, 1.0f, 32, 16);
+    
+    // Create default preview shader
+    const char* preview_vertex = 
+        "#version 330 core\n"
+        "layout(location = 0) in vec3 a_Position;\n"
+        "layout(location = 1) in vec3 a_Normal;\n"
+        "layout(location = 2) in vec2 a_TexCoord;\n"
+        "uniform mat4 u_MVP;\n"
+        "uniform mat4 u_Model;\n"
+        "uniform mat3 u_NormalMatrix;\n"
+        "out vec3 v_Normal;\n"
+        "out vec2 v_TexCoord;\n"
+        "out vec3 v_WorldPos;\n"
+        "void main() {\n"
+        "    gl_Position = u_MVP * vec4(a_Position, 1.0);\n"
+        "    v_Normal = u_NormalMatrix * a_Normal;\n"
+        "    v_TexCoord = a_TexCoord;\n"
+        "    v_WorldPos = (u_Model * vec4(a_Position, 1.0)).xyz;\n"
+        "}\n";
+    
+    const char* preview_fragment = 
+        "#version 330 core\n"
+        "in vec3 v_Normal;\n"
+        "in vec2 v_TexCoord;\n"
+        "in vec3 v_WorldPos;\n"
+        "uniform vec3 u_LightDir;\n"
+        "uniform vec3 u_ViewPos;\n"
+        "uniform vec4 u_BaseColor;\n"
+        "uniform float u_Metallic;\n"
+        "uniform float u_Roughness;\n"
+        "uniform sampler2D u_BaseColorMap;\n"
+        "uniform sampler2D u_NormalMap;\n"
+        "uniform sampler2D u_MetallicRoughnessMap;\n"
+        "out vec4 FragColor;\n"
+        "void main() {\n"
+        "    vec3 normal = normalize(v_Normal);\n"
+        "    vec3 lightDir = normalize(u_LightDir);\n"
+        "    float NdotL = max(dot(normal, lightDir), 0.0);\n"
+        "    vec3 diffuse = u_BaseColor.rgb * NdotL;\n"
+        "    vec3 ambient = u_BaseColor.rgb * 0.1;\n"
+        "    FragColor = vec4(ambient + diffuse, u_BaseColor.a);\n"
+        "}\n";
+    
+    ShaderSource preview_source = {
+        .vertex_source = preview_vertex,
+        .fragment_source = preview_fragment
+    };
+    
+    system->preview_shader = g_renderer_api->create_shader(renderer, &preview_source);
+    
+    g_material_system = system;
+    
+    printf("Material System initialized\n");
+    printf("  Live preview: %s\n", system->live_preview_enabled ? "enabled" : "disabled");
+    printf("  Preview rate: %.1f FPS\n", system->preview_update_rate);
+    
+    return system;
+}
+
+// Create material template
+MaterialTemplate* material_create_template(MaterialSystem* system, const char* name, const char* category) {
+    if (system->template_count >= MAX_MATERIAL_TEMPLATES) {
+        return NULL;
+    }
+    
+    MaterialTemplate* template = &system->templates[system->template_count++];
+    memset(template, 0, sizeof(MaterialTemplate));
+    
+    strncpy(template->name, name, sizeof(template->name) - 1);
+    strncpy(template->category, category, sizeof(template->category) - 1);
+    
+    // Set default preview settings
+    template->preview_mesh = system->preview_sphere;
+    memset(&template->preview_transform, 0, sizeof(Mat4));
+    template->preview_transform.m[0] = template->preview_transform.m[5] = template->preview_transform.m[10] = template->preview_transform.m[15] = 1.0f;
+    template->preview_light_dir = (Vec3){0.5f, 0.7f, 0.5f};
+    
+    // Default render state
+    template->default_state.blend_mode = BLEND_MODE_OPAQUE;
+    template->default_state.cull_mode = CULL_MODE_BACK;
+    template->default_state.depth_test = DEPTH_TEST_LESS;
+    template->default_state.depth_write = true;
+    template->default_state.wireframe = false;
+    template->default_state.line_width = 1.0f;
+    template->default_state.point_size = 1.0f;
+    
+    return template;
+}
+
+// Add parameter to template
+void material_template_add_float(MaterialTemplate* template, const char* name, const char* display_name,
+                                 float min_val, float max_val, float default_val) {
+    if (template->param_count >= MAX_MATERIAL_PARAMS) return;
+    
+    MaterialParamDesc* param = &template->params[template->param_count++];
+    strncpy(param->name, name, sizeof(param->name) - 1);
+    strncpy(param->display_name, display_name, sizeof(param->display_name) - 1);
+    param->type = MATERIAL_PARAM_FLOAT;
+    param->data.float_range.min = min_val;
+    param->data.float_range.max = max_val;
+    param->data.float_range.default_val = default_val;
+    param->ui_step = (max_val - min_val) / 100.0f;
+}
+
+void material_template_add_color(MaterialTemplate* template, const char* name, const char* display_name,
+                                 Vec4 default_color) {
+    if (template->param_count >= MAX_MATERIAL_PARAMS) return;
+    
+    MaterialParamDesc* param = &template->params[template->param_count++];
+    strncpy(param->name, name, sizeof(param->name) - 1);
+    strncpy(param->display_name, display_name, sizeof(param->display_name) - 1);
+    param->type = MATERIAL_PARAM_COLOR;
+    param->data.color.default_val = default_color;
+}
+
+void material_template_add_texture(MaterialTemplate* template, const char* name, const char* display_name,
+                                   const char* default_path) {
+    if (template->param_count >= MAX_MATERIAL_PARAMS) return;
+    
+    MaterialParamDesc* param = &template->params[template->param_count++];
+    strncpy(param->name, name, sizeof(param->name) - 1);
+    strncpy(param->display_name, display_name, sizeof(param->display_name) - 1);
+    param->type = MATERIAL_PARAM_TEXTURE;
+    if (default_path) {
+        strncpy(param->data.texture.path, default_path, sizeof(param->data.texture.path) - 1);
+    }
+}
+
+// Create material instance
+MaterialInstance* material_create_instance(MaterialSystem* system, MaterialTemplate* template) {
+    if (system->instance_count >= MAX_MATERIAL_INSTANCES) {
+        return NULL;
+    }
+    
+    MaterialInstance* instance = &system->instances[system->instance_count++];
+    memset(instance, 0, sizeof(MaterialInstance));
+    
+    instance->template_ref = template;
+    instance->render_state = template->default_state;
+    instance->preview_dirty = true;
+    
+    // Initialize parameter values to defaults
+    for (uint32_t i = 0; i < template->param_count; i++) {
+        MaterialParamDesc* param = &template->params[i];
+        
+        switch (param->type) {
+            case MATERIAL_PARAM_FLOAT:
+                instance->values[i].f = param->data.float_range.default_val;
+                break;
+            case MATERIAL_PARAM_FLOAT2:
+                instance->values[i].v2 = param->data.float2_range.default_val;
+                break;
+            case MATERIAL_PARAM_FLOAT3:
+                instance->values[i].v3 = param->data.float3_range.default_val;
+                break;
+            case MATERIAL_PARAM_FLOAT4:
+                instance->values[i].v4 = param->data.float4_range.default_val;
+                break;
+            case MATERIAL_PARAM_COLOR:
+                instance->values[i].v4 = param->data.color.default_val;
+                break;
+            case MATERIAL_PARAM_TEXTURE:
+                instance->values[i].tex = param->data.texture.handle;
+                break;
+            case MATERIAL_PARAM_BOOL:
+                instance->values[i].b = param->data.boolean.default_val;
+                break;
+            case MATERIAL_PARAM_INT:
+                instance->values[i].i = param->data.int_range.default_val;
+                break;
+            case MATERIAL_PARAM_ENUM:
+                instance->values[i].i = param->data.enum_options.default_val;
+                break;
+        }
+    }
+    
+    // Create preview render target
+    RenderTargetDesc rt_desc = {
+        .width = PREVIEW_SIZE,
+        .height = PREVIEW_SIZE,
+        .color_format = TEXTURE_FORMAT_RGBA8,
+        .depth_format = TEXTURE_FORMAT_DEPTH24_STENCIL8,
+        .sample_count = 1,
+        .color_attachment_count = 1,
+        .name = "MaterialPreview"
+    };
+    instance->preview_target = g_renderer_api->create_render_target(system->renderer, &rt_desc);
+    
+    system->materials_created++;
+    
+    return instance;
+}
+
+// Update material parameter
+void material_set_float(MaterialInstance* instance, const char* name, float value) {
+    MaterialTemplate* template = instance->template_ref;
+    
+    for (uint32_t i = 0; i < template->param_count; i++) {
+        if (strcmp(template->params[i].name, name) == 0 && 
+            template->params[i].type == MATERIAL_PARAM_FLOAT) {
+            
+            // Clamp to range
+            float min = template->params[i].data.float_range.min;
+            float max = template->params[i].data.float_range.max;
+            value = value < min ? min : (value > max ? max : value);
+            
+            if (instance->values[i].f != value) {
+                instance->values[i].f = value;
+                instance->preview_dirty = true;
+            }
+            break;
+        }
+    }
+}
+
+void material_set_color(MaterialInstance* instance, const char* name, Vec4 color) {
+    MaterialTemplate* template = instance->template_ref;
+    
+    for (uint32_t i = 0; i < template->param_count; i++) {
+        if (strcmp(template->params[i].name, name) == 0 && 
+            template->params[i].type == MATERIAL_PARAM_COLOR) {
+            
+            if (memcmp(&instance->values[i].v4, &color, sizeof(Vec4)) != 0) {
+                instance->values[i].v4 = color;
+                instance->preview_dirty = true;
+            }
+            break;
+        }
+    }
+}
+
+void material_set_texture(MaterialInstance* instance, const char* name, TextureHandle texture) {
+    MaterialTemplate* template = instance->template_ref;
+    
+    for (uint32_t i = 0; i < template->param_count; i++) {
+        if (strcmp(template->params[i].name, name) == 0 && 
+            template->params[i].type == MATERIAL_PARAM_TEXTURE) {
+            
+            if (instance->values[i].tex.id != texture.id) {
+                instance->values[i].tex = texture;
+                instance->preview_dirty = true;
+            }
+            break;
+        }
+    }
+}
+
+// Apply material to renderer
+MaterialHandle material_get_render_handle(MaterialSystem* system, MaterialInstance* instance) {
+    if (!instance->renderer_handle.id || instance->preview_dirty) {
+        // Build material properties for renderer
+        MaterialProperty* properties = (MaterialProperty*)alloca(sizeof(MaterialProperty) * instance->template_ref->param_count);
+        size_t prop_count = 0;
+        
+        for (uint32_t i = 0; i < instance->template_ref->param_count; i++) {
+            MaterialParamDesc* param = &instance->template_ref->params[i];
+            MaterialProperty* prop = &properties[prop_count++];
+            
+            prop->name = param->name;
+            
+            switch (param->type) {
+                case MATERIAL_PARAM_FLOAT:
+                    prop->type = UNIFORM_TYPE_FLOAT;
+                    prop->value.f = instance->values[i].f;
+                    break;
+                case MATERIAL_PARAM_FLOAT2:
+                    prop->type = UNIFORM_TYPE_VEC2;
+                    prop->value.v2 = instance->values[i].v2;
+                    break;
+                case MATERIAL_PARAM_FLOAT3:
+                    prop->type = UNIFORM_TYPE_VEC3;
+                    prop->value.v3 = instance->values[i].v3;
+                    break;
+                case MATERIAL_PARAM_FLOAT4:
+                case MATERIAL_PARAM_COLOR:
+                    prop->type = UNIFORM_TYPE_VEC4;
+                    prop->value.v4 = instance->values[i].v4;
+                    break;
+                case MATERIAL_PARAM_TEXTURE:
+                    prop->type = UNIFORM_TYPE_TEXTURE2D;
+                    prop->value.texture = instance->values[i].tex;
+                    break;
+                case MATERIAL_PARAM_BOOL:
+                    prop->type = UNIFORM_TYPE_INT;
+                    prop->value.i = instance->values[i].b ? 1 : 0;
+                    break;
+                case MATERIAL_PARAM_INT:
+                case MATERIAL_PARAM_ENUM:
+                    prop->type = UNIFORM_TYPE_INT;
+                    prop->value.i = instance->values[i].i;
+                    break;
+            }
+        }
+        
+        MaterialDesc desc = {
+            .shader = instance->template_ref->shader,
+            .properties = properties,
+            .property_count = prop_count,
+            .render_state = instance->render_state,
+            .name = instance->template_ref->name
+        };
+        
+        if (instance->renderer_handle.id) {
+            g_renderer_api->update_material(system->renderer, instance->renderer_handle, properties, prop_count);
+        } else {
+            instance->renderer_handle = g_renderer_api->create_material(system->renderer, &desc);
+        }
+        
+        instance->preview_dirty = false;
+    }
+    
+    return instance->renderer_handle;
+}
+
+// Render material preview
+void material_render_preview(MaterialSystem* system, MaterialInstance* instance) {
+    if (!instance->preview_dirty && !system->live_preview_enabled) {
+        return;
+    }
+    
+    // Set render target
+    RenderCommand* cmd = g_renderer_api->push_command(system->renderer);
+    cmd->type = RENDER_CMD_SET_RENDER_TARGET;
+    cmd->data.render_target.target = instance->preview_target;
+    
+    // Clear
+    cmd = g_renderer_api->push_command(system->renderer);
+    cmd->type = RENDER_CMD_CLEAR;
+    cmd->data.clear.flags = CLEAR_ALL;
+    cmd->data.clear.color = (Vec4){0.1f, 0.1f, 0.1f, 1.0f};
+    cmd->data.clear.depth = 1.0f;
+    cmd->data.clear.stencil = 0;
+    
+    // Set viewport
+    cmd = g_renderer_api->push_command(system->renderer);
+    cmd->type = RENDER_CMD_SET_VIEWPORT;
+    cmd->data.viewport.viewport.x = 0;
+    cmd->data.viewport.viewport.y = 0;
+    cmd->data.viewport.viewport.width = PREVIEW_SIZE;
+    cmd->data.viewport.viewport.height = PREVIEW_SIZE;
+    cmd->data.viewport.viewport.min_depth = 0.0f;
+    cmd->data.viewport.viewport.max_depth = 1.0f;
+    
+    // Draw preview mesh with material
+    MaterialHandle mat_handle = material_get_render_handle(system, instance);
+    g_renderer_api->draw_mesh(system->renderer, 
+                             instance->template_ref->preview_mesh,
+                             mat_handle,
+                             &instance->template_ref->preview_transform);
+    
+    // Reset render target
+    cmd = g_renderer_api->push_command(system->renderer);
+    cmd->type = RENDER_CMD_SET_RENDER_TARGET;
+    cmd->data.render_target.target = (RenderTargetHandle){0, 0};
+    
+    instance->preview_dirty = false;
+    instance->last_preview_time = platform_get_time();
+    system->preview_renders++;
+}
+
+// Update all material previews
+void material_system_update(MaterialSystem* system, float dt) {
+    if (!system->live_preview_enabled) return;
+    
+    float preview_interval = 1.0f / system->preview_update_rate;
+    uint64_t current_time = platform_get_time();
+    
+    for (uint32_t i = 0; i < system->instance_count; i++) {
+        MaterialInstance* instance = &system->instances[i];
+        
+        if (instance->preview_dirty || 
+            (current_time - instance->last_preview_time) > preview_interval * 1000000) {
+            material_render_preview(system, instance);
+        }
+    }
+}
+
+// Shader reload callback
+static void material_shader_reloaded(ShaderHandle shader, void* user_data) {
+    MaterialSystem* system = (MaterialSystem*)user_data;
+    
+    // Mark all materials using this shader as dirty
+    for (uint32_t i = 0; i < system->instance_count; i++) {
+        MaterialInstance* instance = &system->instances[i];
+        if (instance->template_ref->shader.id == shader.id) {
+            instance->preview_dirty = true;
+        }
+    }
+    
+    printf("Material previews marked for update after shader reload\n");
+}
+
+// Initialize standard material library
+void material_init_standard_library(MaterialSystem* system) {
+    // Register shader reload callback
+    g_renderer_api->register_shader_reload_callback(system->renderer, material_shader_reloaded, system);
+    
+    // Create PBR material template
+    MaterialTemplate* pbr = material_create_template(system, "PBR", "Standard");
+    material_template_add_color(pbr, "u_BaseColor", "Base Color", (Vec4){1.0f, 1.0f, 1.0f, 1.0f});
+    material_template_add_float(pbr, "u_Metallic", "Metallic", 0.0f, 1.0f, 0.0f);
+    material_template_add_float(pbr, "u_Roughness", "Roughness", 0.0f, 1.0f, 0.5f);
+    material_template_add_float(pbr, "u_AO", "Ambient Occlusion", 0.0f, 1.0f, 1.0f);
+    material_template_add_texture(pbr, "u_BaseColorMap", "Base Color Map", NULL);
+    material_template_add_texture(pbr, "u_NormalMap", "Normal Map", NULL);
+    material_template_add_texture(pbr, "u_MetallicRoughnessMap", "Metallic/Roughness Map", NULL);
+    material_template_add_texture(pbr, "u_AOMap", "AO Map", NULL);
+    
+    // Create Unlit material template
+    MaterialTemplate* unlit = material_create_template(system, "Unlit", "Standard");
+    material_template_add_color(unlit, "u_Color", "Color", (Vec4){1.0f, 1.0f, 1.0f, 1.0f});
+    material_template_add_texture(unlit, "u_Texture", "Texture", NULL);
+    material_template_add_float(unlit, "u_EmissiveIntensity", "Emissive Intensity", 0.0f, 10.0f, 0.0f);
+    
+    // Create Toon material template
+    MaterialTemplate* toon = material_create_template(system, "Toon", "Stylized");
+    material_template_add_color(toon, "u_BaseColor", "Base Color", (Vec4){1.0f, 1.0f, 1.0f, 1.0f});
+    material_template_add_color(toon, "u_ShadowColor", "Shadow Color", (Vec4){0.5f, 0.5f, 0.5f, 1.0f});
+    material_template_add_float(toon, "u_ShadowThreshold", "Shadow Threshold", 0.0f, 1.0f, 0.5f);
+    material_template_add_float(toon, "u_ShadowSoftness", "Shadow Softness", 0.0f, 1.0f, 0.1f);
+    material_template_add_color(toon, "u_RimColor", "Rim Color", (Vec4){1.0f, 1.0f, 1.0f, 1.0f});
+    material_template_add_float(toon, "u_RimPower", "Rim Power", 0.0f, 10.0f, 2.0f);
+    
+    printf("Standard material library initialized with %d templates\n", system->template_count);
+}
+
+// Export material to file
+void material_export(MaterialInstance* instance, const char* path) {
+    PlatformFile file = platform_open_file(path, FILE_MODE_WRITE);
+    if (!file.handle) return;
+    
+    // Write header
+    const char* header = "# Material File v1.0\n";
+    platform_write_file(&file, header, strlen(header));
+    
+    // Write template name
+    char buffer[512];
+    snprintf(buffer, sizeof(buffer), "template: %s\n", instance->template_ref->name);
+    platform_write_file(&file, buffer, strlen(buffer));
+    
+    // Write parameters
+    for (uint32_t i = 0; i < instance->template_ref->param_count; i++) {
+        MaterialParamDesc* param = &instance->template_ref->params[i];
+        
+        switch (param->type) {
+            case MATERIAL_PARAM_FLOAT:
+                snprintf(buffer, sizeof(buffer), "%s: %f\n", param->name, instance->values[i].f);
+                break;
+            case MATERIAL_PARAM_FLOAT2:
+                snprintf(buffer, sizeof(buffer), "%s: %f %f\n", param->name, 
+                        instance->values[i].v2.x, instance->values[i].v2.y);
+                break;
+            case MATERIAL_PARAM_FLOAT3:
+                snprintf(buffer, sizeof(buffer), "%s: %f %f %f\n", param->name,
+                        instance->values[i].v3.x, instance->values[i].v3.y, instance->values[i].v3.z);
+                break;
+            case MATERIAL_PARAM_FLOAT4:
+            case MATERIAL_PARAM_COLOR:
+                snprintf(buffer, sizeof(buffer), "%s: %f %f %f %f\n", param->name,
+                        instance->values[i].v4.x, instance->values[i].v4.y, 
+                        instance->values[i].v4.z, instance->values[i].v4.w);
+                break;
+            case MATERIAL_PARAM_TEXTURE:
+                snprintf(buffer, sizeof(buffer), "%s: texture_%d\n", param->name, instance->values[i].tex.id);
+                break;
+            case MATERIAL_PARAM_BOOL:
+                snprintf(buffer, sizeof(buffer), "%s: %s\n", param->name, instance->values[i].b ? "true" : "false");
+                break;
+            case MATERIAL_PARAM_INT:
+            case MATERIAL_PARAM_ENUM:
+                snprintf(buffer, sizeof(buffer), "%s: %d\n", param->name, instance->values[i].i);
+                break;
+        }
+        
+        platform_write_file(&file, buffer, strlen(buffer));
+    }
+    
+    platform_close_file(&file);
+    printf("Material exported to: %s\n", path);
+}
+
+// Get material system statistics
+void material_get_stats(MaterialSystem* system) {
+    printf("Material System Statistics:\n");
+    printf("  Templates: %d/%d\n", system->template_count, MAX_MATERIAL_TEMPLATES);
+    printf("  Instances: %d/%d\n", system->instance_count, MAX_MATERIAL_INSTANCES);
+    printf("  Materials created: %d\n", system->materials_created);
+    printf("  Materials destroyed: %d\n", system->materials_destroyed);
+    printf("  Preview renders: %d\n", system->preview_renders);
+    printf("  Live preview: %s\n", system->live_preview_enabled ? "enabled" : "disabled");
+}

@@ -83,7 +83,12 @@ if [ "$HOT_RELOAD" != "yes" ]; then
     echo "" >> $UNITY_FILE
     echo "// Core systems" >> $UNITY_FILE
     
-    # Renderer
+    # Renderer (new production system)
+    if [ -f "systems/renderer/handmade_renderer_opengl.c" ]; then
+        echo "#include \"systems/renderer/handmade_renderer_opengl.c\"" >> $UNITY_FILE
+    fi
+    
+    # Legacy renderer (if exists)
     if [ -f "systems/renderer/renderer.c" ]; then
         echo "#include \"systems/renderer/renderer.c\"" >> $UNITY_FILE
         echo "#include \"systems/renderer/shader.c\"" >> $UNITY_FILE
