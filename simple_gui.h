@@ -111,4 +111,7 @@ typedef struct {
 
 void simple_gui_toolbar(simple_gui *gui, i32 x, i32 y, gui_tool_button *tools, i32 tool_count);
 
+// Drawing utilities
+void simple_gui_separator(simple_gui *gui, i32 x, i32 y, i32 width);
+
 #endif // SIMPLE_GUI_H

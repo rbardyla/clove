@@ -1,52 +1,75 @@
 #!/bin/bash
 
-# Minimal build script for the foundation
-# Compiles only the platform layer + our minimal main.c
+# Handmade Engine Build Script
+# Builds the engine with basic renderer capabilities
 
-echo "Building Handmade Engine Foundation..."
+set -e
 
-# Compiler flags
-CC=gcc
+echo "=== BUILDING HANDMADE ENGINE WITH RENDERER ==="
+echo ""
+
+# Compiler flags following handmade philosophy
 CFLAGS="-std=c99 -Wall -Wextra -Wno-unused-parameter"
-CFLAGS="$CFLAGS -O2 -march=native"  # Release optimizations
-CFLAGS="$CFLAGS -g"                 # Debug info
-CFLAGS="$CFLAGS -DGUI_DEMO_STANDALONE"  # Enable GUI standalone mode
-LIBS="-lX11 -lGL -lGLX -lm -lpthread -ldl"
+LIBS="-lGL -lX11 -lpthread -lm -ldl"
 
-# Output
-OUTPUT="handmade_foundation"
+# Build mode
+BUILD_MODE=${1:-debug}
 
-# Build command - include GUI system, minimal renderer, and asset system
-SOURCES="main.c handmade_platform_linux.c minimal_renderer.c simple_gui.c handmade_assets.c"
-echo "Compiling: $CC $CFLAGS $SOURCES $LIBS -o $OUTPUT"
+if [ "$BUILD_MODE" = "release" ]; then
+    CFLAGS="$CFLAGS -O3 -DNDEBUG -march=native"
+    echo "Building RELEASE version (optimized)"
+else
+    CFLAGS="$CFLAGS -g -DHANDMADE_DEBUG=1 -DHANDMADE_INTERNAL=1"
+    echo "Building DEBUG version"
+fi
 
-$CC $CFLAGS $SOURCES $LIBS -o $OUTPUT
+echo "Compiler flags: $CFLAGS"
+echo ""
+
+# Clean previous build
+rm -f minimal_engine
+
+# Compile
+echo "Compiling engine with renderer and GUI..."
+gcc $CFLAGS main_minimal.c handmade_renderer.c handmade_gui.c handmade_platform_linux.c -o minimal_engine $LIBS
 
 if [ $? -eq 0 ]; then
-    echo "Build successful! Run with: ./$OUTPUT"
     echo ""
-    echo "Features:"
-    echo "  - Complete editor interface with panels"
-    echo "  - Asset Browser with filesystem scanning"
-    echo "  - Texture loading (BMP format)"
-    echo "  - Model loading (OBJ format)"
-    echo "  - Sound loading (WAV format)"
-    echo "  - Thumbnail generation for assets"
-    echo "  - Scene Hierarchy and Property Inspector"
-    echo "  - Performance overlay"
+    echo "=== BUILD SUCCESSFUL ==="
+    echo ""
+    echo "Executable: ./minimal_engine"
+    echo "Size: $(ls -lh minimal_engine | awk '{print $5}')"
     echo ""
     echo "Controls:"
-    echo "  ESC   - Quit"  
-    echo "  F1-F4 - Toggle editor panels"
-    echo "  1-4   - Select tools"
-    echo "  Arrow Keys - Navigate asset browser"
-    echo "  Enter - Open folder/Load asset"
+    echo "  ESC - Quit"
+    echo "  SPACE - Print debug info"
+    echo "  WASD - Move camera"
+    echo "  Q/E - Zoom camera"
+    echo "  G - Toggle GUI debug panel"
+    echo "  H - Toggle GUI demo panel"
     echo ""
-    echo "You should see:"
-    echo "  - Animated background with colorful triangle"
-    echo "  - GUI windows with buttons, sliders, and text"
-    echo "  - Performance metrics overlay"
+    echo "Renderer features:"
+    echo "  ✓ Basic shapes (triangles, quads, circles, lines)"
+    echo "  ✓ 2D sprite rendering with textures"
+    echo "  ✓ BMP texture loading support"
+    echo "  ✓ Basic 2D camera with zoom and pan"
+    echo "  ✓ Immediate mode rendering (no batching yet)"
+    echo "  ✓ Text rendering with bitmap fonts"
+    echo ""
+    echo "GUI features:"
+    echo "  ✓ Immediate-mode GUI system"
+    echo "  ✓ Button and checkbox widgets"
+    echo "  ✓ Panel system with dragging"
+    echo "  ✓ Text labels and debug info"
+    echo "  ✓ Built on working renderer system"
+    echo ""
+    echo "Following handmade philosophy:"
+    echo "  ✓ Always have something working"
+    echo "  ✓ Understand every line of code" 
+    echo "  ✓ No external dependencies (except OS/OpenGL)"
+    echo "  ✓ Performance first approach"
+    echo ""
 else
-    echo "Build failed!"
+    echo "BUILD FAILED"
     exit 1
 fi

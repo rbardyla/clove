@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
+#include <stdlib.h>
 
 // Parallel rendering command buffer
 typedef struct RenderCommand {
@@ -252,9 +253,9 @@ static void load_asset_job(void* data, u32 thread_index) {
     ctx->size = ftell(file);
     fseek(file, 0, SEEK_SET);
     
-    // Allocate from thread-local temp memory
-    ThreadContext* thread_ctx = tls_current_context;
-    ctx->data = thread_pool_alloc_temp(thread_ctx, ctx->size);
+    // For now, use malloc instead of thread-local memory
+    // TODO: Implement proper thread-local memory allocation
+    ctx->data = malloc(ctx->size);
     
     if (!ctx->data) {
         fclose(file);
@@ -271,8 +272,8 @@ static void load_asset_job(void* data, u32 thread_index) {
         case ASSET_TYPE_TEXTURE:
             // Would decode texture here
             break;
-        case ASSET_TYPE_MESH:
-            // Would parse mesh here
+        case ASSET_TYPE_MODEL:
+            // Would parse model here
             break;
         case ASSET_TYPE_SHADER:
             // Would compile shader here

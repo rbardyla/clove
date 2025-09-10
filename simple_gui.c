@@ -504,3 +504,10 @@ bool simple_gui_input_text(simple_gui *gui, i32 x, i32 y, i32 width, char *buffe
     gui->widgets_drawn++;
     return field->editing;
 }
+
+// Draw a horizontal separator line
+void simple_gui_separator(simple_gui *gui, i32 x, i32 y, i32 width) {
+    color32 line_color = rgb(80, 80, 80);
+    renderer_fill_rect(gui->r, x, y, width, 1, line_color);
+    gui->widgets_drawn++;
+}
