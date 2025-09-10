@@ -1,0 +1,3 @@
+cc1: fatal error: gui_demo.c: No such file or directory
+cc1: fatal error: handmade_gui.c: No such file or directory
+cc1: fatal error: handmade_renderer.c: No such file or directory

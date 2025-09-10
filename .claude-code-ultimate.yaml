@@ -1,0 +1,30 @@
+# .claude-code-ultimate.yaml
+mode: "production_critical"
+
+behavior:
+  never_give_up: true
+  always_verify: true
+  require_working_code: true
+  max_attempts_per_problem: 100
+  
+context:
+  always_current: true
+  include_all_code: true
+  update_before_each_run: true
+  
+quality:
+  compilation: "required"
+  testing: "required"
+  performance: "required"
+  memory_safety: "required"
+  
+persistence:
+  retry_forever: true
+  decompose_on_failure: true
+  try_all_approaches: true
+  
+forbidden:
+  - giving_up
+  - skipping
+  - deferring
+  - partial_solutions

@@ -1,0 +1,44 @@
+project:
+  name: "Game Engine Editor"
+  quality_mode: "production"
+  
+agents:
+  always_run:
+    - validator
+    - pessimist
+  
+validation:
+  mandatory_checks:
+    - compilation: "-Wall -Werror -O2"
+    - memory: "valgrind --leak-check=full"
+    - performance: "maintain 60fps"
+    - tests: "100% pass rate"
+  
+  reject_phrases:
+    - "should work"
+    - "probably fine"
+    - "mostly working"
+    - "good enough"
+  
+  require_evidence:
+    - benchmark_results
+    - memory_report
+    - test_coverage
+    - profiler_output
+
+  
+context:
+  mode: "strict"
+  always_include:
+    - "CURRENT_STATE.md"      # Auto-generated every commit
+    - "src/**/*.h"             # ALL headers, always
+    - "ARCHITECTURE.md"        # Your actual architecture
+    - "BUILD_OUTPUT.log"       # Last build results
+    - "MEMORY_LAYOUT.md"       # Actual memory map
+  
+  refresh_interval: "every_command"
+  
+  validation:
+    require_file_exists: true
+    reject_hallucinated_imports: true
+    verify_symbol_references: true

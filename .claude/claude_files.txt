@@ -1,0 +1,1 @@
+./COMPARE_VERSIONS.sh: line 17: claude-code: command not found

@@ -1,0 +1,20 @@
+# .claude-code-persistence.yaml
+retry_policy:
+  max_attempts: 20  # Don't give up easily
+  backoff: "none"    # Keep trying immediately
+  
+  on_difficulty:
+    action: "decompose"  # Break into smaller problems
+    never_skip: true     # NEVER move on without solving
+    
+  on_failure:
+    collect_diagnostics: true
+    increase_context: true
+    try_alternative_approach: true
+    
+  forbidden_responses:
+    - "This is too complex"
+    - "I'll skip this for now"
+    - "Let's move on"
+    - "This might not be possible"
+    - "We can address this later"

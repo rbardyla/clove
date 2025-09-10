@@ -1,0 +1,13 @@
+update_ai 0
+render_scene 0
+memory_task 0
+render_ui 0
+update_game_logic 0
+update_audio 0
+x 0
+ÐDiA–x 0
+¶ 0
+update_ai 0
+ 0
+update_physics 0
+inner_processing 0

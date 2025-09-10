@@ -1,0 +1,13 @@
+=== CLAUDE CODE REALITY ENFORCER ===
+=== UPDATING CODEBASE STATE ===
+✓ Context state updated in /home/thebackhand/Projects/handmade-engine/CURRENT_STATE.md
+  Claude Code will now see your actual codebase state
+Code verification hash: 104f68ed7ac7ae064f9ec13874f963b5
+Executing Claude Code with reality enforcement...
+./claude-code-real.sh: line 74: claude-code: command not found
+
+=== POST-EXECUTION VALIDATION ===
+No files modified
+
+=== Reality enforcement complete ===
+Verification hash: 104f68ed7ac7ae064f9ec13874f963b5
