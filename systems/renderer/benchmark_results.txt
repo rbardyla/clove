@@ -1,0 +1,242 @@
+Model name:                           Intel(R) Core(TM) i7-10750H CPU @ 2.60GHz
+L3 cache:                             12 MiB (1 instance)
+========================================
+    HEADLESS RENDERER BENCHMARK
+========================================
+CPU-side rendering performance analysis
+No OpenGL/X11 dependencies required
+
+System Information:
+
+----------------------------------------
+
+=== Matrix Multiplication Benchmark ===
+  Iterations: 100000
+  Total time: 2.034 ms
+  Per operation: 0.020340 µs
+  Operations/sec: 49164208
+
+=== Matrix Multiplication Benchmark ===
+  Iterations: 1000000
+  Total time: 21.858 ms
+  Per operation: 0.021858 µs
+  Operations/sec: 45749840
+
+=== Transform Operations Benchmark ===
+  Point transforms: 100000
+  Total time: 0.813 ms
+  Per transform: 0.008130 µs
+  Transforms/sec: 123001230
+
+=== Transform Operations Benchmark ===
+  Point transforms: 1000000
+  Total time: 7.649 ms
+  Per transform: 0.007649 µs
+  Transforms/sec: 130736044
+
+=== Frustum Culling Benchmark ===
+  Objects tested: 10000
+  Sphere culling:
+    Time: 0.107 ms
+    Visible: 1327 (13.3%)
+    Per test: 0.010700 µs
+  AABB culling:
+    Time: 0.118 ms
+    Visible: 1425 (14.2%)
+    Per test: 0.011800 µs
+
+=== Frustum Culling Benchmark ===
+  Objects tested: 100000
+  Sphere culling:
+    Time: 1.181 ms
+    Visible: 13387 (13.4%)
+    Per test: 0.011810 µs
+  AABB culling:
+    Time: 1.449 ms
+    Visible: 14152 (14.2%)
+    Per test: 0.014490 µs
+
+=== Draw Call Batching Benchmark ===
+  Objects: 10000
+  Materials: 10
+  Shaders: 5
+  Batching time: 0.252 ms
+  Draw calls: 10000
+  State changes: 50
+  Batching ratio: 200.00:1
+
+=== Draw Call Batching Benchmark ===
+  Objects: 50000
+  Materials: 50
+  Shaders: 10
+  Batching time: 2.498 ms
+  Draw calls: 50000
+  State changes: 500
+  Batching ratio: 100.00:1
+
+=== Memory Allocation Patterns Benchmark ===
+  Small allocations (10000 x 48 bytes):
+    Time: 0.182 ms
+    Per alloc: 0.009100 µs
+  Medium allocations (1000 x 4KB):
+    Time: 0.065 ms
+    Per alloc: 0.032500 µs
+  Large allocations (100 x 1MB):
+    Time: 0.548 ms
+    Per alloc: 2.740000 µs
+  Arena allocations (10000 ops):
+    Time: 0.134 ms
+    Speedup vs small: 1.36x
+
+=== Scene Graph Traversal Benchmark ===
+  Node count: 10000
+  Full traversal: 0.242 ms
+  Per node: 0.024200 µs
+  Partial update (10% dirty): 0.342 ms
+  Speedup: 0.71x
+
+=== Scene Graph Traversal Benchmark ===
+  Node count: 50000
+  Full traversal: 1.090 ms
+  Per node: 0.021800 µs
+  Partial update (10% dirty): 0.735 ms
+  Speedup: 1.48x
+
+=== Vector Operations Benchmark ===
+  Vector count: 1000000
+  Addition: 4.086 ms (0.24 Gops/s)
+  Dot product: 2.439 ms (0.41 Gops/s)
+  Cross product: 1.825 ms (0.55 Gops/s)
+  Normalization: 1.417 ms (0.71 Gops/s)
+
+=== Vector Operations Benchmark ===
+  Vector count: 10000000
+  Addition: 35.964 ms (0.28 Gops/s)
+  Dot product: 21.098 ms (0.47 Gops/s)
+  Cross product: 25.415 ms (0.39 Gops/s)
+  Normalization: 15.382 ms (0.65 Gops/s)
+
+========================================
+         BENCHMARK COMPLETE
+========================================
+Model name:                           Intel(R) Core(TM) i7-10750H CPU @ 2.60GHz
+L3 cache:                             12 MiB (1 instance)
+========================================
+    HEADLESS RENDERER BENCHMARK
+========================================
+CPU-side rendering performance analysis
+No OpenGL/X11 dependencies required
+
+System Information:
+
+----------------------------------------
+
+=== Matrix Multiplication Benchmark ===
+  Iterations: 100000
+  Total time: 3.466 ms
+  Per operation: 0.034660 µs
+  Operations/sec: 28851702
+
+=== Matrix Multiplication Benchmark ===
+  Iterations: 1000000
+  Total time: 22.865 ms
+  Per operation: 0.022865 µs
+  Operations/sec: 43734966
+
+=== Transform Operations Benchmark ===
+  Point transforms: 100000
+  Total time: 0.684 ms
+  Per transform: 0.006840 µs
+  Transforms/sec: 146198830
+
+=== Transform Operations Benchmark ===
+  Point transforms: 1000000
+  Total time: 7.656 ms
+  Per transform: 0.007656 µs
+  Transforms/sec: 130616510
+
+=== Frustum Culling Benchmark ===
+  Objects tested: 10000
+  Sphere culling:
+    Time: 0.111 ms
+    Visible: 1327 (13.3%)
+    Per test: 0.011100 µs
+  AABB culling:
+    Time: 0.131 ms
+    Visible: 1425 (14.2%)
+    Per test: 0.013100 µs
+
+=== Frustum Culling Benchmark ===
+  Objects tested: 100000
+  Sphere culling:
+    Time: 1.264 ms
+    Visible: 13387 (13.4%)
+    Per test: 0.012640 µs
+  AABB culling:
+    Time: 1.805 ms
+    Visible: 14152 (14.2%)
+    Per test: 0.018050 µs
+
+=== Draw Call Batching Benchmark ===
+  Objects: 10000
+  Materials: 10
+  Shaders: 5
+  Batching time: 0.366 ms
+  Draw calls: 10000
+  State changes: 50
+  Batching ratio: 200.00:1
+
+=== Draw Call Batching Benchmark ===
+  Objects: 50000
+  Materials: 50
+  Shaders: 10
+  Batching time: 1.793 ms
+  Draw calls: 50000
+  State changes: 500
+  Batching ratio: 100.00:1
+
+=== Memory Allocation Patterns Benchmark ===
+  Small allocations (10000 x 48 bytes):
+    Time: 0.181 ms
+    Per alloc: 0.009050 µs
+  Medium allocations (1000 x 4KB):
+    Time: 0.066 ms
+    Per alloc: 0.033000 µs
+  Large allocations (100 x 1MB):
+    Time: 0.553 ms
+    Per alloc: 2.765000 µs
+  Arena allocations (10000 ops):
+    Time: 0.134 ms
+    Speedup vs small: 1.35x
+
+=== Scene Graph Traversal Benchmark ===
+  Node count: 10000
+  Full traversal: 0.096 ms
+  Per node: 0.009600 µs
+  Partial update (10% dirty): 0.067 ms
+  Speedup: 1.43x
+
+=== Scene Graph Traversal Benchmark ===
+  Node count: 50000
+  Full traversal: 0.539 ms
+  Per node: 0.010780 µs
+  Partial update (10% dirty): 0.367 ms
+  Speedup: 1.47x
+
+=== Vector Operations Benchmark ===
+  Vector count: 1000000
+  Addition: 5.529 ms (0.18 Gops/s)
+  Dot product: 6.199 ms (0.16 Gops/s)
+  Cross product: 2.632 ms (0.38 Gops/s)
+  Normalization: 1.584 ms (0.63 Gops/s)
+
+=== Vector Operations Benchmark ===
+  Vector count: 10000000
+  Addition: 40.036 ms (0.25 Gops/s)
+  Dot product: 29.322 ms (0.34 Gops/s)
+  Cross product: 22.840 ms (0.44 Gops/s)
+  Normalization: 17.884 ms (0.56 Gops/s)
+
+========================================
+         BENCHMARK COMPLETE
+========================================

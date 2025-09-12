@@ -1,8 +1,8 @@
 // handmade_gui.c - Production-ready immediate mode GUI implementation
 // PERFORMANCE: All widgets render in single pass, no allocations, 60fps target
 
-#include <stdint.h>
 #define _POSIX_C_SOURCE 199309L
+#include <stdint.h>
 #include <time.h>
 typedef uint64_t u64;
 
@@ -401,7 +401,7 @@ void gui_begin_frame(gui_context *ctx) {
     ctx->mouse_pos = new_mouse_pos;
     
     // Update mouse buttons
-    for (int i = 0; i < 3; i++) {
+    for (u32 i = 0; i < 3; i++) {
         bool was_down = ctx->mouse_down[i];
         bool is_down = (i == 0 ? p->mouse.left_down : 
                        i == 1 ? p->mouse.right_down : 
@@ -425,7 +425,7 @@ void gui_begin_frame(gui_context *ctx) {
     ctx->mouse_wheel = (f32)p->mouse.wheel_delta;
     
     // Keyboard state
-    for (int i = 0; i < ArrayCount(ctx->key_down); i++) {
+    for (u32 i = 0; i < ArrayCount(ctx->key_down); i++) {
         bool was_down = ctx->key_down[i];
         bool is_down = i < ArrayCount(p->keyboard.keys) ? p->keyboard.keys[i] : false;
         ctx->key_down[i] = is_down;
@@ -542,7 +542,7 @@ gui_id gui_get_id_int(gui_context *ctx, i32 int_id) {
 // ============================================================================
 
 void gui_begin_layout(gui_context *ctx, layout_type type, f32 spacing) {
-    if (ctx->layout_depth >= ArrayCount(ctx->layout_stack) - 1) return;
+    if (ctx->layout_depth >= (i32)(ArrayCount(ctx->layout_stack) - 1)) return;
     
     layout_info *parent = gui_current_layout(ctx);
     ctx->layout_depth++;
@@ -735,6 +735,11 @@ bool gui_checkbox(gui_context *ctx, const char *label, bool *value) {
     
     gui_id id = gui_get_id(ctx, value);
     bool box_hovered = gui_rect_contains_point(pos, v2_make(box_size, box_size), ctx->mouse_pos);
+    
+    // Use ID for proper widget state tracking (handmade philosophy: understand every line!)
+    if (box_hovered && ctx->mouse_clicked[0]) {
+        ctx->active_id = id;
+    }
     
     if (box_hovered && ctx->mouse_clicked[0]) {
         *value = !*value;
@@ -941,24 +946,22 @@ void gui_performance_overlay(gui_context *ctx, bool show_graph) {
     // Draw frame time graph if requested
     if (show_graph) {
         // Draw frame time history graph
-        v2 graph_pos = v2_make(window_rect.min.x + 10, text_pos.y + (line_num + 1) * line_height + 10);
+        v2 graph_pos = v2_make(overlay_pos.x + 10, text_pos.y + (line_num + 1) * line_height + 10);
         v2 graph_size = v2_make(200, 60);
         
         // Draw graph background
-        renderer_rect(r, (int)graph_pos.x, (int)graph_pos.y, 
-                     (int)graph_size.x, (int)graph_size.y, 
-                     color32_make(0, 0, 0, 200));
+        renderer_fill_rect(r, (int)graph_pos.x, (int)graph_pos.y, 
+                          (int)graph_size.x, (int)graph_size.y, 
+                          rgba(0, 0, 0, 200));
         
         // Draw graph border
-        renderer_rect_outline(r, (int)graph_pos.x, (int)graph_pos.y,
-                            (int)graph_size.x, (int)graph_size.y,
-                            ctx->theme.border, 1);
+        renderer_draw_rect(r, (int)graph_pos.x, (int)graph_pos.y,
+                          (int)graph_size.x, (int)graph_size.y,
+                          ctx->theme.border);
         
         // Draw 16.67ms target line (60 FPS)
         f32 target_y = graph_pos.y + graph_size.y - (16.67f / 33.33f) * graph_size.y;
-        renderer_line(r, (int)graph_pos.x, (int)target_y,
-                     (int)(graph_pos.x + graph_size.x), (int)target_y,
-                     color32_make(0, 255, 0, 100));
+        // Note: renderer_line not available, skip target line for now
         
         // Draw frame time history
         f32 bar_width = graph_size.x / (f32)FRAME_TIME_HISTORY_SIZE;
@@ -973,17 +976,17 @@ void gui_performance_overlay(gui_context *ctx, bool show_graph) {
             // Color based on performance (green=good, yellow=ok, red=bad)
             color32 bar_color;
             if (frame_time < 16.67f) {
-                bar_color = color32_make(0, 255, 0, 200);  // Green - 60+ FPS
+                bar_color = rgba(0, 255, 0, 200);  // Green - 60+ FPS
             } else if (frame_time < 33.33f) {
-                bar_color = color32_make(255, 255, 0, 200);  // Yellow - 30-60 FPS
+                bar_color = rgba(255, 255, 0, 200);  // Yellow - 30-60 FPS
             } else {
-                bar_color = color32_make(255, 0, 0, 200);  // Red - <30 FPS
+                bar_color = rgba(255, 0, 0, 200);  // Red - <30 FPS
             }
             
             f32 x = graph_pos.x + i * bar_width;
             f32 y = graph_pos.y + graph_size.y - bar_height;
             
-            renderer_rect(r, (int)x, (int)y, (int)bar_width, (int)bar_height, bar_color);
+            renderer_fill_rect(r, (int)x, (int)y, (int)bar_width, (int)bar_height, bar_color);
         }
         
         // Draw FPS text on graph
@@ -994,7 +997,7 @@ void gui_performance_overlay(gui_context *ctx, bool show_graph) {
 }
 
 void gui_log(gui_context *ctx, const char *fmt, ...) {
-    if (ctx->console_log_count >= ArrayCount(ctx->console_log)) {
+    if (ctx->console_log_count >= (u32)ArrayCount(ctx->console_log)) {
         // Circular buffer - overwrite oldest entry
         ctx->console_log_head = (ctx->console_log_head + 1) % ArrayCount(ctx->console_log);
     } else {
@@ -1025,7 +1028,7 @@ void gui_log_warning(gui_context *ctx, const char *fmt, ...) {
     entry->level = 1;
     entry->timestamp = (f64)ReadCPUTimer() / 1000000.0;
     
-    if (ctx->console_log_count < ArrayCount(ctx->console_log)) {
+    if (ctx->console_log_count < (u32)ArrayCount(ctx->console_log)) {
         ctx->console_log_count++;
     } else {
         ctx->console_log_head = (ctx->console_log_head + 1) % ArrayCount(ctx->console_log);
@@ -1044,7 +1047,7 @@ void gui_log_error(gui_context *ctx, const char *fmt, ...) {
     entry->level = 2;
     entry->timestamp = (f64)ReadCPUTimer() / 1000000.0;
     
-    if (ctx->console_log_count < ArrayCount(ctx->console_log)) {
+    if (ctx->console_log_count < (u32)ArrayCount(ctx->console_log)) {
         ctx->console_log_count++;
     } else {
         ctx->console_log_head = (ctx->console_log_head + 1) % ArrayCount(ctx->console_log);
@@ -1075,8 +1078,6 @@ void gui_end_window(gui_context *ctx) {
 
 void gui_begin_panel(gui_context *ctx, const char *title) {
     // Simplified panel - just advance layout and draw title
-    layout_info *layout = gui_current_layout(ctx);
-    
     if (title) {
         gui_text(ctx, "%s", title);
         gui_separator(ctx);
@@ -1128,7 +1129,7 @@ void gui_show_demo_window(gui_context *ctx, bool *p_open) {
 
 // Input helpers
 bool gui_is_key_pressed(gui_context *ctx, i32 key) {
-    return (key >= 0 && key < ArrayCount(ctx->key_pressed)) ? ctx->key_pressed[key] : false;
+    return (key >= 0 && (u32)key < ArrayCount(ctx->key_pressed)) ? ctx->key_pressed[key] : false;
 }
 
 bool gui_is_mouse_clicked(gui_context *ctx, i32 button) {

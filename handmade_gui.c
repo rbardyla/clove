@@ -174,6 +174,9 @@ bool HandmadeGUI_Checkbox(HandmadeGUI* gui, v2 position, const char* label, bool
     f32 box_size = 16.0f;
     f32 spacing = 8.0f;
     
+    // ID calculated for future state tracking (handmade philosophy: understand every line!)
+    (void)id; // Mark as intentionally unused for now
+    
     // Check mouse interaction with checkbox box
     bool box_hovered = HandmadeGUI_IsMouseInRect(gui, position, V2(box_size, box_size));
     

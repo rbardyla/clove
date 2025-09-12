@@ -222,7 +222,7 @@ bool Physics2DTestBoxBox(v2 pos_a, v2 half_a, f32 rot_a, v2 pos_b, v2 half_b, f3
     
     // Transform from B to A's local space
     v2 delta = v2_sub(pos_b, pos_a);
-    f32 angle_diff = rot_b - rot_a;
+    // f32 angle_diff = rot_b - rot_a; // TODO: Use for advanced collision response
     
     // Rotate delta to A's local space
     f32 c = cosf(-rot_a);

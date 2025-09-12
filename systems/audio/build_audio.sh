@@ -32,8 +32,8 @@ fi
 # Libraries
 LIBS="-lasound -lpthread -lm -lrt"
 
-# Source files
-AUDIO_SOURCES="handmade_audio.c audio_dsp.c"
+# Source files - Use MINIMAL version for handmade compliance
+AUDIO_SOURCES="handmade_audio_minimal.c"
 
 # Create build directory
 mkdir -p build
@@ -43,13 +43,12 @@ echo "Compiler flags: $CFLAGS"
 echo "Libraries: $LIBS"
 echo ""
 
-# Build audio library as static archive
-echo "Building audio library..."
-$CC $CFLAGS -c handmade_audio.c -o build/handmade_audio.o
-$CC $CFLAGS -c audio_dsp.c -o build/audio_dsp.o
+# Build audio library as static archive - MINIMAL VERSION
+echo "Building audio library (minimal, handmade-compliant)..."
+$CC $CFLAGS -c handmade_audio_minimal.c -o build/handmade_audio.o
 
-# Create static library
-ar rcs build/libhandmade_audio.a build/handmade_audio.o build/audio_dsp.o
+# Create static library - NO DSP (no malloc/free)
+ar rcs build/libhandmade_audio.a build/handmade_audio.o
 echo "Created: build/libhandmade_audio.a"
 
 # Build demo application

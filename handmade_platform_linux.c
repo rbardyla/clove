@@ -190,6 +190,7 @@ static void LinuxDebugBreak(void) {
 
 // Dialog functions (using zenity if available)
 static char* LinuxOpenFileDialog(const char* filter, MemoryArena* arena) {
+    (void)filter;  // TODO: Add filter support
     char command[1024];
     snprintf(command, sizeof(command), "zenity --file-selection 2>/dev/null");
     
@@ -216,7 +217,8 @@ static void LinuxShowErrorBox(const char* title, const char* message) {
     snprintf(command, sizeof(command), 
              "zenity --error --title='%s' --text='%s' 2>/dev/null",
              title, message);
-    system(command);
+    int ret = system(command);
+    (void)ret; // Explicitly ignore return value for GUI popup
 }
 
 // Key translation  
@@ -574,6 +576,7 @@ bool PlatformInit(PlatformState* platform, const char* title, u32 width, u32 hei
 }
 
 void PlatformShutdown(PlatformState* platform) {
+    (void)platform;  // Platform data is in global state
     if (g_linux_data.gl_context) {
         glXMakeCurrent(g_linux_data.display, None, NULL);
         glXDestroyContext(g_linux_data.display, g_linux_data.gl_context);
@@ -604,6 +607,7 @@ bool PlatformProcessEvents(PlatformState* platform) {
 }
 
 void PlatformSwapBuffers(PlatformState* platform) {
+    (void)platform;  // Platform data is in global state
     glXSwapBuffers(g_linux_data.display, g_linux_data.window);
 }
 

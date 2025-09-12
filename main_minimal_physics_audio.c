@@ -32,10 +32,12 @@ typedef struct {
     Physics2DWorld physics;
     audio_system audio;
     
-    // Memory pools
+    // Memory pools - HANDMADE PHILOSOPHY: No malloc/free in hot paths!
     MemoryArena physics_arena;
-    u8* physics_memory;
-    u8* audio_memory;
+    MemoryArena audio_arena;
+    // Pre-allocated static memory - deterministic, no fragmentation
+    u8 physics_memory[MEGABYTES(2)];
+    u8 audio_memory[MEGABYTES(8)];
     
     // Demo state
     bool physics_enabled;
@@ -65,21 +67,38 @@ typedef struct {
     
     // Demo objects
     f32 demo_rotation;
+    
+    // Performance tracking
+    f32 fps_timer;
+    u32 frame_count;
+    f32 current_fps;
+    f32 frame_time_ms;
 } GameState;
 
 static GameState g_state = {0};
 
-// Generate simple procedural collision sound (sine wave beep)
-static audio_handle GenerateCollisionSound(audio_system* audio, f32 frequency, f32 duration, f32 volume) {
-    if (!audio || !g_state.audio_enabled) return AUDIO_INVALID_HANDLE;
+// Generate simple procedural collision sound using arena allocator - NO MALLOC/FREE!
+static audio_handle GenerateCollisionSound(MemoryArena* arena, audio_system* audio, f32 frequency, f32 duration, f32 volume) {
+    if (!arena || !audio || !g_state.audio_enabled) return AUDIO_INVALID_HANDLE;
     
     u32 sample_rate = AUDIO_SAMPLE_RATE;
     u32 frame_count = (u32)(duration * sample_rate);
     u32 size = frame_count * 2 * sizeof(int16_t); // Stereo
     
-    // Allocate temporary buffer for sound generation
-    int16_t* samples = (int16_t*)malloc(size);
-    if (!samples) return AUDIO_INVALID_HANDLE;
+    // Arena allocation - handmade philosophy: no malloc/free in hot paths!
+    if (duration > 1.0f || frame_count > 44100) {
+        return AUDIO_INVALID_HANDLE; // Prevent excessive memory usage
+    }
+    
+    // Allocate from arena - deterministic, fast, no fragmentation
+    u64 arena_start = arena->used;
+    int16_t* samples = (int16_t*)((u8*)arena->base + arena->used);
+    arena->used += size;
+    
+    if (arena->used > arena->size) {
+        arena->used = arena_start; // Rollback allocation
+        return AUDIO_INVALID_HANDLE;
+    }
     
     // Generate sine wave
     for (u32 i = 0; i < frame_count; i++) {
@@ -97,8 +116,8 @@ static audio_handle GenerateCollisionSound(audio_system* audio, f32 frequency, f
     
     // Load the generated sound into audio system
     audio_handle handle = audio_load_wav_from_memory(audio, samples, size);
-    free(samples);
     
+    // Arena memory stays allocated for lifetime of sounds - no free() needed!
     return handle;
 }
 
@@ -112,10 +131,11 @@ static void PlayCollisionSound(audio_system* audio, v2 impact_point, f32 impact_
     
     // Generate a quick beep sound if we don't have pre-loaded sounds
     if (g_state.collision_sound_soft == AUDIO_INVALID_HANDLE) {
-        // Generate procedural sounds on first collision
-        g_state.collision_sound_soft = GenerateCollisionSound(audio, 200.0f, 0.1f, 0.5f);
-        g_state.collision_sound_hard = GenerateCollisionSound(audio, 400.0f, 0.15f, 0.7f);
-        g_state.collision_sound_metal = GenerateCollisionSound(audio, 800.0f, 0.08f, 0.6f);
+        // Generate procedural sounds using pre-allocated audio arena - NO malloc/free!
+        MemoryArena* audio_arena = &g_state.audio_arena;
+        g_state.collision_sound_soft = GenerateCollisionSound(audio_arena, audio, 200.0f, 0.1f, 0.5f);
+        g_state.collision_sound_hard = GenerateCollisionSound(audio_arena, audio, 400.0f, 0.15f, 0.7f);
+        g_state.collision_sound_metal = GenerateCollisionSound(audio_arena, audio, 800.0f, 0.08f, 0.6f);
     }
     
     // Choose sound based on impact strength
@@ -299,6 +319,12 @@ void GameInit(PlatformState* platform) {
     g_state.master_volume = 0.8f;
     g_state.effects_volume = 1.0f;
     
+    // Initialize performance tracking
+    g_state.fps_timer = 0.0f;
+    g_state.frame_count = 0;
+    g_state.current_fps = 0.0f;
+    g_state.frame_time_ms = 0.0f;
+    
     // Initialize renderer
     if (!RendererInit(&g_state.renderer, platform->window.width, platform->window.height)) {
         printf("Failed to initialize renderer!\n");
@@ -311,11 +337,9 @@ void GameInit(PlatformState* platform) {
         return;
     }
     
-    // Allocate and initialize physics
-    size_t physics_memory_size = MEGABYTES(2);
-    g_state.physics_memory = (u8*)malloc(physics_memory_size);
+    // Initialize physics arena - HANDMADE: No heap allocation!
     g_state.physics_arena.base = g_state.physics_memory;
-    g_state.physics_arena.size = physics_memory_size;
+    g_state.physics_arena.size = sizeof(g_state.physics_memory);
     g_state.physics_arena.used = 0;
     
     if (!Physics2DInit(&g_state.physics, &g_state.physics_arena, 300)) {
@@ -326,11 +350,12 @@ void GameInit(PlatformState* platform) {
         g_state.physics.debug_draw_enabled = true;
     }
     
-    // Initialize audio system
-    size_t audio_memory_size = MEGABYTES(8);
-    g_state.audio_memory = (u8*)malloc(audio_memory_size);
+    // Initialize audio arena - HANDMADE: No heap allocation!
+    g_state.audio_arena.base = g_state.audio_memory;
+    g_state.audio_arena.size = sizeof(g_state.audio_memory);
+    g_state.audio_arena.used = 0;
     
-    if (!audio_init(&g_state.audio, audio_memory_size)) {
+    if (!audio_init(&g_state.audio, &g_state.audio_arena)) {
         printf("Warning: Failed to initialize audio system\n");
         g_state.audio_enabled = false;
     } else {
@@ -378,6 +403,18 @@ void GameUpdate(PlatformState* platform, f32 dt) {
     
     g_state.time_accumulator += dt;
     g_state.demo_rotation += dt * 0.5f;
+    
+    // Update FPS tracking
+    g_state.frame_time_ms = dt * 1000.0f;
+    g_state.frame_count++;
+    g_state.fps_timer += dt;
+    
+    // Calculate FPS every 0.5 seconds for smooth display
+    if (g_state.fps_timer >= 0.5f) {
+        g_state.current_fps = (f32)g_state.frame_count / g_state.fps_timer;
+        g_state.frame_count = 0;
+        g_state.fps_timer = 0.0f;
+    }
     
     // Handle input
     if (platform->input.keys[KEY_ESCAPE].pressed) {
@@ -648,6 +685,17 @@ void GameRender(PlatformState* platform) {
             v2 cursor = HandmadeGUI_GetCursor(&g_state.gui);
             
             char text[128];
+            
+            // FPS and performance stats first - most important!
+            snprintf(text, sizeof(text), "FPS: %.1f", g_state.current_fps);
+            Color fps_color = g_state.current_fps >= 60.0f ? COLOR(0.3f, 0.9f, 0.3f, 1.0f) : COLOR(0.9f, 0.3f, 0.3f, 1.0f);
+            HandmadeGUI_Text(&g_state.gui, cursor, text, 1.0f, fps_color);
+            
+            cursor.y -= 20.0f;
+            snprintf(text, sizeof(text), "Frame: %.2fms", g_state.frame_time_ms);
+            HandmadeGUI_Label(&g_state.gui, cursor, text);
+            
+            cursor.y -= 20.0f;
             snprintf(text, sizeof(text), "Time: %.2f", g_state.time_accumulator);
             HandmadeGUI_Label(&g_state.gui, cursor, text);
             
@@ -690,7 +738,6 @@ void GameRender(PlatformState* platform) {
             v2 cursor = HandmadeGUI_GetCursor(&g_state.gui);
             
             char text[128];
-            char vol_text[64];
             
             // Audio status
             snprintf(text, sizeof(text), "Audio: %s", 
@@ -749,6 +796,27 @@ void GameRender(PlatformState* platform) {
         }
     }
     
+    // HANDMADE PERFORMANCE DISPLAY - Casey would approve!
+    v2 fps_pos = V2(10.0f, (f32)g_state.gui.renderer->viewport_height - 30.0f);
+    char fps_text[128];
+    
+    // Performance status: GREEN = handmade target achieved, RED = needs optimization
+    bool performance_target_met = g_state.current_fps >= 60.0f && g_state.frame_time_ms <= 16.67f;
+    Color perf_color = performance_target_met ? COLOR(0.2f, 1.0f, 0.2f, 1.0f) : COLOR(1.0f, 0.2f, 0.2f, 1.0f);
+    
+    snprintf(fps_text, sizeof(fps_text), "HANDMADE ENGINE: %.1f FPS (%.3fms) %s", 
+             g_state.current_fps, g_state.frame_time_ms,
+             performance_target_met ? "✓ FAST" : "✗ SLOW");
+    HandmadeGUI_Text(&g_state.gui, fps_pos, fps_text, 1.8f, perf_color);
+    
+    // Memory usage display (arena-based, predictable)
+    fps_pos.y -= 25.0f;
+    f32 physics_mb = (f32)g_state.physics_arena.used / (1024.0f * 1024.0f);
+    f32 audio_mb = (f32)g_state.audio_arena.used / (1024.0f * 1024.0f);
+    snprintf(fps_text, sizeof(fps_text), "MEMORY: Physics %.2fMB | Audio %.2fMB | ZERO MALLOC!", 
+             physics_mb, audio_mb);
+    HandmadeGUI_Text(&g_state.gui, fps_pos, fps_text, 1.0f, COLOR(0.8f, 0.8f, 1.0f, 1.0f));
+    
     // Title and instructions
     v2 overlay_pos = V2(10.0f, (f32)g_state.gui.renderer->viewport_height - 100.0f);
     HandmadeGUI_Text(&g_state.gui, overlay_pos, "Handmade Engine + Physics + Audio", 1.2f, COLOR_WHITE);
@@ -781,15 +849,8 @@ void GameShutdown(PlatformState* platform) {
         audio_shutdown(&g_state.audio);
     }
     
-    if (g_state.physics_memory) {
-        free(g_state.physics_memory);
-        g_state.physics_memory = NULL;
-    }
-    
-    if (g_state.audio_memory) {
-        free(g_state.audio_memory);
-        g_state.audio_memory = NULL;
-    }
+    // HANDMADE: No free() needed - static memory management!
+    // Physics and audio memory are static arrays, automatically cleaned up
     
     g_state.initialized = false;
 }

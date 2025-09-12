@@ -16,6 +16,11 @@
 #include <stdbool.h>
 #include <stddef.h>
 
+/* Need to include platform header for MemoryArena */
+#ifndef HANDMADE_PLATFORM_H
+#include "../../handmade_platform.h"
+#endif
+
 /* Configuration constants */
 #define AUDIO_SAMPLE_RATE 48000
 #define AUDIO_CHANNELS 2
@@ -211,8 +216,10 @@ typedef struct {
 typedef uint32_t audio_handle;
 #define AUDIO_INVALID_HANDLE 0
 
+/* MemoryArena is now available from handmade_platform.h */
+
 /* Core system functions */
-bool audio_init(audio_system *audio, size_t memory_size);
+bool audio_init(audio_system *audio, MemoryArena *arena);
 void audio_shutdown(audio_system *audio);
 void audio_update(audio_system *audio, float dt);
 

@@ -3,6 +3,7 @@
     Provides window creation and OpenGL context for Linux
 */
 
+#define _GNU_SOURCE  // For clock_gettime and other GNU extensions
 #include "handmade_platform.h"
 #include "handmade_opengl.h"
 #include <stdio.h>
